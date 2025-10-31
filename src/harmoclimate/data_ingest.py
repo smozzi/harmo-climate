@@ -15,7 +15,7 @@ try:
 except ImportError as exc:  # pragma: no cover - execution stops before tests
     raise ImportError("pyarrow is required for HarmoClimate data ingestion.") from exc
 
-from .config import CHUNK_SIZE, PARQUET_PATH, STATION_KEYWORD
+from .config import CHUNK_SIZE, STATION_CODE, build_artifact_paths, slugify_station_name
 
 
 @dataclass
@@ -28,6 +28,16 @@ class StationRecord:
     lat: float
     alti: float
     delta_utc_solar_h: float
+
+
+@dataclass
+class StreamResult:
+    """Container bundling streamed station records and generated artefact info."""
+
+    station_records: List[StationRecord]
+    parquet_path: Path
+    station_name: str
+    station_slug: str
 
 
 def choose_columns(colnames: Iterable[str]) -> Tuple[str, str, str, str, str, str, str]:
@@ -60,16 +70,29 @@ def parse_dt_aaaammjjhh(series: pd.Series) -> pd.Series:
     return pd.to_datetime(s, format="%Y%m%d%H", errors="coerce")
 
 
+def _normalize_station_code(value: object) -> str:
+    """Coerce a station code value to the canonical string representation."""
+
+    code = str(value).strip()
+    if not code:
+        return ""
+    return code.replace(".0", "")  # CSV exports frequently store codes as floats
+
+
 def stream_filter_to_disk(
     urls: Iterable[str],
-    parquet_path: Path = PARQUET_PATH,
+    station_code: str = STATION_CODE,
     chunk_size: int = CHUNK_SIZE,
-) -> List[StationRecord]:
+) -> StreamResult:
     """Stream Meteo-France archives, filter rows, and persist the reduced dataset."""
 
-    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    station_code_str = _normalize_station_code(station_code)
 
-    writer = None
+    writer: pq.ParquetWriter | None = None
+    parquet_path: Path | None = None
+    station_name: str | None = None
+    station_slug: str | None = None
+
     total_kept = 0
     station_records: List[StationRecord] = []
 
@@ -95,11 +118,27 @@ def stream_filter_to_disk(
                 col_alti,
             ) = choose_columns(list(chunk.columns))
 
-            mask = chunk[col_station].astype(str).str.contains(STATION_KEYWORD, case=False, na=False)
+            code_series = chunk[col_code].astype("string").str.strip().str.replace(r"\\.0$", "", regex=True)
+            mask = code_series == station_code_str
+            if not mask.any():
+                continue
+
             keep_cols = [col_dt, col_T, col_U, col_lon, col_station, col_lat, col_code, col_alti]
             sub = chunk.loc[mask, keep_cols].copy()
             if sub.empty:
                 continue
+
+            if station_name is None:
+                names = sub[col_station].astype("string").str.strip()
+                candidate = next((name for name in names if name), "")
+                fallback_name = station_code_str if not candidate else candidate
+                station_name = candidate or fallback_name
+                station_slug = slugify_station_name(station_name) or slugify_station_name(fallback_name)
+                parquet_path = build_artifact_paths(station_slug).parquet
+                parquet_path.parent.mkdir(parents=True, exist_ok=True)
+                parquet_path.unlink(missing_ok=True)
+
+            sub[col_code] = code_series[mask].to_numpy()
 
             sub["dt_local"] = parse_dt_aaaammjjhh(sub[col_dt])
             sub[col_T] = pd.to_numeric(sub[col_T], errors="coerce")
@@ -139,7 +178,7 @@ def stream_filter_to_disk(
                         lat=float(row["LAT"]),
                         alti=float(row["ALTI"]),
                         delta_utc_solar_h=float(row["delta_utc_solar_h"]),
-                        station_code=str(row[col_code]) if pd.notna(row[col_code]) else None,
+                        station_code=_normalize_station_code(row[col_code]),
                     )
                 )
 
@@ -156,6 +195,8 @@ def stream_filter_to_disk(
             sub = sub[final_cols].astype(np.float32)
 
             table = pa.Table.from_pandas(sub, preserve_index=False)
+            if parquet_path is None or station_slug is None:
+                raise RuntimeError("Parquet output path was not initialised.")
             if writer is None:
                 writer = pq.ParquetWriter(str(parquet_path), table.schema)
             writer.write_table(table)
@@ -167,13 +208,19 @@ def stream_filter_to_disk(
     if writer is not None:
         writer.close()
 
+    if parquet_path is None or station_name is None or station_slug is None:
+        raise RuntimeError(f"No data found for station code {station_code_str}")
+
     print(f"[OK] Wrote {total_kept:,} filtered rows -> {parquet_path}")
-    return station_records
+    return StreamResult(
+        station_records=station_records,
+        parquet_path=parquet_path,
+        station_name=station_name,
+        station_slug=station_slug,
+    )
 
 
-def load_filtered_dataset(
-    parquet_path: Path = PARQUET_PATH,
-) -> pd.DataFrame:
+def load_filtered_dataset(parquet_path: Path) -> pd.DataFrame:
     """Load the filtered dataset produced by :func:`stream_filter_to_disk`."""
 
     cols_to_read = ["yday_frac_solar", "hour_solar", "T_C", "RH", "LON", "delta_utc_solar_h", "LAT"]
@@ -183,12 +230,12 @@ def load_filtered_dataset(
 
     df = pd.read_parquet(parquet_path)
 
-    df = df[cols_to_read]
-    return df
+    return df[cols_to_read]
 
 
 __all__ = [
     "StationRecord",
+    "StreamResult",
     "choose_columns",
     "load_filtered_dataset",
     "parse_dt_aaaammjjhh",

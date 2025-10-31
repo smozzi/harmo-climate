@@ -2,9 +2,6 @@
 generated/*
 !generated/.gitkeep
 !generated/data/.gitkeep
-!generated/media/.gitkeep
-!generated/models/.gitkeep
-!generated/templates/.gitkeep
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
