@@ -58,19 +58,18 @@ The `generated/` directory is tracked with placeholder files so that the folder 
 
 ## Configuration
 
-Station-specific configuration and filesystem paths live in `src/harmoclimate/config.py`:
+Station-specific configuration lives in `src/harmoclimate/config.py`:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `DEPARTMENT_CODE` | French department identifier used in Météo-France file URLs. | `18` (Cher) |
-| `TARGET_CITY_NAME` | Informational label for the generated model. | `"Bourges"` |
-| `STATION_KEYWORD` | Case-insensitive substring used to filter station rows. | `"BOURGES"` |
+| `STATION_CODE` | Eight-digit `NUM_POSTE` identifier used as the default when no station code is provided to the CLI. | `"18033001"` (Bourges) |
 | `COUNTRY_CODE` | ISO 3166-1 alpha-2 code stored in metadata. | `"fr"` |
 | `MODEL_VERSION` | Version string embedded in exported metadata. | `"1.0"` |
 | `CHUNK_SIZE` | Number of rows per streamed CSV chunk. | `200_000` |
 | `RANDOM_SEED` | Seed for PyTorch training reproducibility. | `42` |
+| `SAMPLES_PER_DAY` | Number of samples used in visualization helpers. | `96` |
 
-Filesystem-related constants (e.g. `PARQUET_PATH`, `MODEL_JSON_PATH`, `CPP_HEADER_PATH`) are derived automatically from the repository root and stored under the `generated/` tree. The output basename follows the template `{country_code}_{target_city_slug}` (defaults to `fr_bourges`), ensuring every generated artefact shares a consistent naming scheme.
+Helper functions such as `department_code_from_station()` and `build_artifact_paths()` derive the department code, file URLs, and output locations automatically. The pipeline inspects the dataset to fetch the station's `NOM_USUEL`, slugifies it, and then writes artefacts under the basename `{country_code}_{station_slug}` (e.g. `fr_bourges`).
 
 ## Prerequisites
 
@@ -92,39 +91,42 @@ source ./scripts/activate.sh
 
 ## Usage
 
-1. **Configure the target station (French stations only for now).**
-   Open `src/harmoclimate/config.py` and adjust the constants in the "Project metadata" section to match the target department and station keyword. Multiple data files are fetched automatically for the configured department.
+The CLI exposes two workflows. All artefacts are written under `generated/{data,models,templates}/`.
 
-2. **Run the training pipeline.**
+1. **Generate a fresh model for a station code.**
    ```bash
-   python main.py
+   python main.py generate 18033001
    ```
-   The script will:
-   - Download and stream historical CSV archives directly from the provided URLs.
-   - Filter rows matching the `STATION_KEYWORD` and compute solar-time features.
-   - Persist the filtered dataset to `generated/data/{country_code}_{target_city_slug}.parquet`.
+   The command will:
+   - Download and stream historical CSV archives for the department inferred from the `NUM_POSTE`.
+   - Filter rows matching the provided station code and compute solar-time features.
+   - Persist the filtered dataset to `generated/data/{country_code}_{station_slug}.parquet`.
    - Fit the four harmonic models in sequence using PyTorch.
    - Report global MAE metrics for temperature (°C) and relative humidity (%).
-   - Export the learned parameters and metadata to `generated/models/{country_code}_{target_city_slug}.json`.
-   - Generate a C++ header (`generated/templates/{country_code}_{target_city_slug}.hpp`) with inline prediction helpers.
+   - Export the learned parameters and metadata to `generated/models/{country_code}_{station_slug}.json`.
+   - Generate a C++ header (`generated/templates/{country_code}_{station_slug}.hpp`) with inline prediction helpers.
 
-3. **Inspect outputs.**
-   - `generated/data/{country_code}_{target_city_slug}.parquet`: preprocessed solar-time dataset.
-   - `generated/models/{country_code}_{target_city_slug}.json`: JSON document containing metadata and learned weights for the annual/diurnal models.
-   - `generated/templates/{country_code}_{target_city_slug}.hpp`: C++ header for embedding the model.
-   - Logged MAE values help assess model accuracy.
+2. **Regenerate outputs from an existing model JSON.**
+   ```bash
+   python main.py regenerate fr_bourges.json
+   ```
+   - If the corresponding cached Parquet dataset is present, it is loaded directly.
+   - Otherwise the pipeline re-streams the archives using the `station_code` stored in the JSON metadata.
+   - Training, evaluation, and export steps mirror the `generate` command.
 
-4. **Optional visualisations.**
+3. **Optional visualisations.**
    The `src/harmoclimate/display.py` module exposes functions to render yearly temperature and humidity curves or compare the model against historical climatology. Ensure `matplotlib` (and `ipywidgets` for interactive plots) is installed before calling these utilities.
+
+4. **Backwards-compatible default.**
+   Running `python main.py` with no arguments still executes the pipeline using the `STATION_CODE` defined in `src/harmoclimate/config.py`. This is useful when scripting or when a default station is preferred.
 
 ## Generating a New Model
 
-To produce a model for another French station:
+To produce a model for another French station, prefer the CLI:
 
-1. Update `DEPARTMENT_CODE`, `TARGET_CITY_NAME`, and `STATION_KEYWORD` in `src/harmoclimate/config.py` to match the new location. The `STATION_KEYWORD` should uniquely identify the desired station name in Météo-France datasets.
-2. Optionally set `MODEL_VERSION` to reflect the release context.
-3. Run `python main.py` to fetch the relevant archives, train the harmonic models, and export parameters.
-4. Review the output JSON and C++ header inside `generated/` to confirm the metadata and coefficients align with the intended station.
+1. Invoke `python main.py generate <NUM_POSTE>` with the desired station code.
+2. Optionally adjust `MODEL_VERSION` in `src/harmoclimate/config.py` if you want to embed a custom revision tag in the metadata.
+3. Review the output JSON and C++ header inside `generated/` to confirm the metadata and coefficients align with the intended station.
 
 ## Model Parameters
 

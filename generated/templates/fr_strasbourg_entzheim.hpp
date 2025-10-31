@@ -1,38 +1,38 @@
 // Auto-generated factorized model (annual + diurnal)
 // Target city / station (France):
-//   Station code : 18033001
-//   Station name : BOURGES
+//   Station code : 67124001
+//   Station name : STRASBOURG-ENTZHEIM
 #pragma once
 #include <cmath>
 namespace harmoclimat {
-static constexpr double longitude_deg = 2.3598330000000005;
-static constexpr double latitude_deg  = 47.059167000000009;
-static constexpr double delta_utc_solar_h = 0.15732220000000002;
-static constexpr double annual_T_mu = 1.2340747117996216;
-static constexpr double annual_T_A1 = 0.84003210067749023;
-static constexpr double annual_T_ph1 = -2.8147907257080078;
-static constexpr double annual_T_A2 = 0.064057320356369019;
-static constexpr double annual_T_ph2 = 1.5921454429626465;
-static constexpr double annual_RH_mu = 75.951568603515625;
-static constexpr double annual_RH_A1 = 11.215866088867188;
-static constexpr double annual_RH_ph1 = 6.1331114768981934;
-static constexpr double annual_RH_A2 = 3.4237644672393799;
-static constexpr double annual_RH_ph2 = -1.0893900394439697;
-static constexpr double diurn_T_a0 = 0.35951963067054749;
-static constexpr double diurn_T_a1 = -0.1620771735906601;
-static constexpr double diurn_T_psiA = -0.0077644437551498413;
-static constexpr double diurn_T_ph0 = -2.7689993381500244;
-static constexpr double diurn_T_k1 = 0.15564507246017456;
-static constexpr double diurn_T_psiP = 0.25791659951210022;
-static constexpr double diurn_T_alpha = 0.05412040650844574;
-static constexpr double diurn_RH_beta_c = -10.514937400817871;
-static constexpr double diurn_RH_core_a0 = 9.9116153717041016;
-static constexpr double diurn_RH_core_a1 = -5.0842032432556152;
-static constexpr double diurn_RH_core_psiA = -0.014052779413759708;
-static constexpr double diurn_RH_core_ph0 = 0.37206146121025085;
-static constexpr double diurn_RH_core_k1 = 0.12076744437217712;
-static constexpr double diurn_RH_core_psiP = 0.20694632828235626;
-static constexpr double diurn_RH_core_alpha = -0.09060533344745636;
+static constexpr double longitude_deg = 7.6403329999999992;
+static constexpr double latitude_deg  = 48.549499999999995;
+static constexpr double delta_utc_solar_h = 0.50935553333333339;
+static constexpr double annual_T_mu = 1.1636315584182739;
+static constexpr double annual_T_A1 = 0.9300883412361145;
+static constexpr double annual_T_ph1 = -2.8835268020629883;
+static constexpr double annual_T_A2 = 0.034305933862924576;
+static constexpr double annual_T_ph2 = 1.5446761846542358;
+static constexpr double annual_RH_mu = 75.915534973144531;
+static constexpr double annual_RH_A1 = 10.875029563903809;
+static constexpr double annual_RH_ph1 = 5.8393154144287109;
+static constexpr double annual_RH_A2 = 1.7902882099151611;
+static constexpr double annual_RH_ph2 = -0.53730154037475586;
+static constexpr double diurn_T_a0 = 0.36953258514404297;
+static constexpr double diurn_T_a1 = -0.18592512607574463;
+static constexpr double diurn_T_psiA = -0.046761497855186462;
+static constexpr double diurn_T_ph0 = -2.8105587959289551;
+static constexpr double diurn_T_k1 = 0.19510172307491302;
+static constexpr double diurn_T_psiP = 0.41472044587135315;
+static constexpr double diurn_T_alpha = 0.073483690619468689;
+static constexpr double diurn_RH_beta_c = -10.741996765136719;
+static constexpr double diurn_RH_core_a0 = 9.8157186508178711;
+static constexpr double diurn_RH_core_a1 = -5.6407065391540527;
+static constexpr double diurn_RH_core_psiA = -0.021593965590000153;
+static constexpr double diurn_RH_core_ph0 = 0.32627090811729431;
+static constexpr double diurn_RH_core_k1 = 0.18019667267799377;
+static constexpr double diurn_RH_core_psiP = 0.56903648376464844;
+static constexpr double diurn_RH_core_alpha = -0.10701234638690948;
 inline double wrap_day(double d){
     while (d > 365.0) d -= 365.0;
     while (d < 0.0)   d += 365.0;

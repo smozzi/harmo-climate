@@ -9,7 +9,6 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
-from .config import STATION_KEYWORD
 from .data_ingest import StationRecord
 
 
@@ -33,7 +32,7 @@ def _mean_or_nan(values: Iterable[float]) -> float:
 def summarize_station(
     records: Iterable[StationRecord],
     df: pd.DataFrame,
-    fallback_name: str = STATION_KEYWORD,
+    fallback_name: Optional[str] = None,
 ) -> StationMetadata:
     """Aggregate per-row observations into a stable station description."""
 
@@ -52,7 +51,7 @@ def summarize_station(
 
     delta_utc_solar_h = _mean_or_nan(delta_values) if delta_values else float(df["delta_utc_solar_h"].mean())
 
-    station_name = name_values[0] if name_values else fallback_name
+    station_name = name_values[0] if name_values else (fallback_name or "Unknown station")
     station_code = code_values[0] if code_values else None
 
     return StationMetadata(

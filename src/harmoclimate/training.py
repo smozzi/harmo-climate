@@ -11,11 +11,29 @@ import pandas as pd
 import torch
 from torch import nn
 
-from .config import COUNTRY_CODE, MODEL_VERSION, RANDOM_SEED, TARGET_CITY_NAME
+from .config import COUNTRY_CODE, MODEL_VERSION, RANDOM_SEED
 
 
 def _to_float_state_dict(module: nn.Module) -> Dict[str, float]:
     return {k: float(v.detach().cpu().numpy()) for k, v in module.state_dict().items()}
+
+
+@dataclass
+class ErrorMetrics:
+    """Collection of scalar error metrics for a predicted variable."""
+
+    mae: float
+    bias: float
+    err_p05: float
+    err_p95: float
+
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            "mae": self.mae,
+            "bias": self.bias,
+            "err_p05": self.err_p05,
+            "err_p95": self.err_p95,
+        }
 
 
 class AnnualHarmonic(nn.Module):
@@ -100,9 +118,24 @@ class TrainingResult:
     annual_RH: AnnualHarmonic
     diurn_T: DiurnalConditioned
     diurn_RH: DiurnalHumidity
-    mae_temperature: float
-    mae_humidity: float
+    metrics_temperature: ErrorMetrics
+    metrics_humidity: ErrorMetrics
     daily_aggregate: pd.DataFrame
+
+
+def _compute_error_metrics(errors: torch.Tensor) -> ErrorMetrics:
+    """Compute MAE, bias, and 5/95th percentiles for a vector of errors."""
+
+    errors_np = np.asarray(errors.detach().cpu().numpy(), dtype=np.float64)
+    valid = errors_np[np.isfinite(errors_np)]
+    if valid.size == 0:
+        return ErrorMetrics(mae=math.nan, bias=math.nan, err_p05=math.nan, err_p95=math.nan)
+
+    mae = float(np.mean(np.abs(valid)))
+    bias = float(np.mean(valid))
+    err_p05 = float(np.quantile(valid, 0.05))
+    err_p95 = float(np.quantile(valid, 0.95))
+    return ErrorMetrics(mae=mae, bias=bias, err_p05=err_p05, err_p95=err_p95)
 
 
 def train_models(df: pd.DataFrame, random_seed: int = RANDOM_SEED) -> TrainingResult:
@@ -146,16 +179,19 @@ def train_models(df: pd.DataFrame, random_seed: int = RANDOM_SEED) -> TrainingRe
     with torch.no_grad():
         T_pred = annual_T(all_day) + diurn_T(all_day, all_hour)
         RH_pred = annual_RH(all_day) + diurn_RH(all_day, all_hour, T_res)
-        mae_T = torch.mean(torch.abs(T_all - T_pred)).item() * 10
-        mae_RH = torch.mean(torch.abs(RH_all - RH_pred)).item()
+        temp_errors = (T_all - T_pred) * 10.0
+        rh_errors = RH_all - RH_pred
+
+    metrics_temperature = _compute_error_metrics(temp_errors)
+    metrics_humidity = _compute_error_metrics(rh_errors)
 
     return TrainingResult(
         annual_T=annual_T,
         annual_RH=annual_RH,
         diurn_T=diurn_T,
         diurn_RH=diurn_RH,
-        mae_temperature=mae_T,
-        mae_humidity=mae_RH,
+        metrics_temperature=metrics_temperature,
+        metrics_humidity=metrics_humidity,
         daily_aggregate=daily,
     )
 
@@ -207,6 +243,7 @@ def build_parameter_bundle(
 
 
 __all__ = [
+    "ErrorMetrics",
     "AnnualHarmonic",
     "DiurnalConditioned",
     "DiurnalHumidity",

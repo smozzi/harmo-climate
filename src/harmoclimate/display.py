@@ -11,14 +11,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from .config import (
-    MODEL_JSON_PATH,
-    PARQUET_PATH,
-    SAMPLES_PER_DAY,
-)
+from .config import SAMPLES_PER_DAY
 
 
-def load_factorized_params(json_path: Path = MODEL_JSON_PATH) -> dict:
+def load_factorized_params(json_path: Path) -> dict:
     """Load the exported parameter bundle and validate minimal metadata."""
 
     with open(json_path, "r", encoding="utf-8") as handle:
@@ -139,7 +135,7 @@ def model_daily_stats_one_year_factorized(params: dict, n_days: int = 365, sampl
     return days, Tmin, Tmax, Tavg, RHmin, RHmax, RHavg
 
 
-def load_history_from_sample_data(parquet_path: Path = PARQUET_PATH) -> pd.DataFrame:
+def load_history_from_sample_data(parquet_path: Path) -> pd.DataFrame:
     if not parquet_path.exists():
         raise FileNotFoundError(f"No historical file found: {parquet_path}")
 
