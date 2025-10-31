@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harmoclimate"
+version = "0.1.0"
+description = "Ultralight harmonic climate model generator"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  {name = "Sébastien Mozzi"},
+]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.1",
+  "torch>=2.0",
+  "pyarrow>=12.0",
+  "matplotlib>=3.7",
+  "ipywidgets>=8.0"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
