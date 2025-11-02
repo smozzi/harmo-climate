@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Tuple
-
-import numpy as np
 import pandas as pd
 
 try:
@@ -40,7 +38,7 @@ class StreamResult:
     station_slug: str
 
 
-def choose_columns(colnames: Iterable[str]) -> Tuple[str, str, str, str, str, str, str]:
+def choose_columns(colnames: Iterable[str]) -> Tuple[str, str, str, str, str, str, str, str]:
     """Validate the expected Meteo-France column names."""
 
     col_code = "NUM_POSTE"
@@ -51,13 +49,14 @@ def choose_columns(colnames: Iterable[str]) -> Tuple[str, str, str, str, str, st
     col_lon = "LON"
     col_lat = "LAT"
     col_alti = "ALTI"
+    col_p = "PSTAT"
 
-    required = [col_code, col_station, col_dt, col_T, col_U, col_lon, col_lat, col_alti]
+    required = [col_code, col_station, col_dt, col_T, col_U, col_lon, col_lat, col_alti, col_p]
     missing = [c for c in required if c not in colnames]
     if missing:
         raise RuntimeError(f"Missing required columns: {missing} in {colnames}")
 
-    return col_code, col_station, col_dt, col_T, col_U, col_lon, col_lat, col_alti
+    return col_code, col_station, col_dt, col_T, col_U, col_lon, col_lat, col_alti, col_p
 
 
 def parse_dt_aaaammjjhh(series: pd.Series) -> pd.Series:
@@ -76,7 +75,10 @@ def _normalize_station_code(value: object) -> str:
     code = str(value).strip()
     if not code:
         return ""
-    return code.replace(".0", "")  # CSV exports frequently store codes as floats
+    code = code.replace(".0", "")  # CSV exports frequently store codes as floats
+    if code.lower() in {"nan", "na", "<na>", "none"}:
+        return ""
+    return code
 
 
 def stream_filter_to_disk(
@@ -116,6 +118,7 @@ def stream_filter_to_disk(
                 col_lon,
                 col_lat,
                 col_alti,
+                col_p,
             ) = choose_columns(list(chunk.columns))
 
             code_series = chunk[col_code].astype("string").str.strip().str.replace(r"\\.0$", "", regex=True)
@@ -123,7 +126,7 @@ def stream_filter_to_disk(
             if not mask.any():
                 continue
 
-            keep_cols = [col_dt, col_T, col_U, col_lon, col_station, col_lat, col_code, col_alti]
+            keep_cols = [col_dt, col_T, col_U, col_lon, col_station, col_lat, col_code, col_alti, col_p]
             sub = chunk.loc[mask, keep_cols].copy()
             if sub.empty:
                 continue
@@ -138,16 +141,17 @@ def stream_filter_to_disk(
                 parquet_path.parent.mkdir(parents=True, exist_ok=True)
                 parquet_path.unlink(missing_ok=True)
 
-            sub[col_code] = code_series[mask].to_numpy()
-
             sub["dt_local"] = parse_dt_aaaammjjhh(sub[col_dt])
             sub[col_T] = pd.to_numeric(sub[col_T], errors="coerce")
             sub[col_U] = pd.to_numeric(sub[col_U], errors="coerce")
             sub["LON"] = pd.to_numeric(sub[col_lon], errors="coerce")
             sub["LAT"] = pd.to_numeric(sub[col_lat], errors="coerce")
             sub["ALTI"] = pd.to_numeric(sub[col_alti], errors="coerce")
+            sub["P"] = pd.to_numeric(sub[col_p], errors="coerce")
+            sub["STATION_CODE"] = code_series[mask].to_numpy()
+            sub["STATION_NAME"] = sub[col_station].astype("string").str.strip()
 
-            sub = sub.dropna(subset=["dt_local", col_T, col_U, "LON", "LAT", "ALTI"])
+            sub = sub.dropna(subset=["dt_local", col_T, col_U, "LON", "LAT", "ALTI", "P"])
 
             sub["dt_local"] = sub["dt_local"].dt.tz_localize(
                 "Europe/Paris",
@@ -156,43 +160,48 @@ def stream_filter_to_disk(
             )
             sub = sub.dropna(subset=["dt_local"])
             sub["dt_utc"] = sub["dt_local"].dt.tz_convert("UTC")
+            sub["DT_UTC"] = sub["dt_utc"]
 
-            sub["T_C"] = sub[col_T] / 10.0
-            sub["RH"] = sub[col_U].clip(0, 100)
-
-            yday_utc = sub["dt_utc"].dt.dayofyear.astype(float)
-            hour_utc = sub["dt_utc"].dt.hour.astype(float) + sub["dt_utc"].dt.minute.astype(float) / 60.0
-            sub["yday_frac_utc"] = yday_utc + hour_utc / 24.0
-            sub["hour_utc"] = hour_utc
-
-            sub["delta_utc_solar_h"] = sub["LON"] / 15.0
-            sub["hour_solar"] = (sub["hour_utc"] + sub["delta_utc_solar_h"]) % 24.0
-            sub["yday_frac_solar"] = sub["yday_frac_utc"] + (sub["LON"] / 360.0)
-            sub.loc[sub["yday_frac_solar"] > 366.0, "yday_frac_solar"] -= 365.0
+            sub["T"] = sub[col_T].astype("float32")
+            sub["RH"] = sub[col_U].clip(0, 100).astype("float32")
+            sub["P"] = sub["P"].astype("float32")
+            sub["LON"] = sub["LON"].astype("float32")
+            sub["LAT"] = sub["LAT"].astype("float32")
+            sub["ALTI"] = sub["ALTI"].astype("float32")
+            sub["STATION_CODE"] = sub["STATION_CODE"].astype("string")
+            sub["STATION_NAME"] = sub["STATION_NAME"].astype("string")
 
             for _, row in sub.iterrows():
+                lon_value = float(row["LON"])
+                name_value = row["STATION_NAME"]
+                if pd.isna(name_value):
+                    name_str = ""
+                else:
+                    name_str = str(name_value)
+                station_code_value = _normalize_station_code(row["STATION_CODE"])
                 station_records.append(
                     StationRecord(
-                        station_name=str(row[col_station]),
-                        lon=float(row["LON"]),
+                        station_name=name_str,
+                        lon=lon_value,
                         lat=float(row["LAT"]),
                         alti=float(row["ALTI"]),
-                        delta_utc_solar_h=float(row["delta_utc_solar_h"]),
-                        station_code=_normalize_station_code(row[col_code]),
+                        delta_utc_solar_h=lon_value / 15.0,
+                        station_code=station_code_value or None,
                     )
                 )
 
             final_cols = [
-                "yday_frac_solar",
-                "hour_solar",
-                "T_C",
+                "STATION_CODE",
+                "STATION_NAME",
+                "DT_UTC",
+                "T",
                 "RH",
+                "P",
                 "LON",
                 "LAT",
                 "ALTI",
-                "delta_utc_solar_h",
             ]
-            sub = sub[final_cols].astype(np.float32)
+            sub = sub[final_cols]
 
             table = pa.Table.from_pandas(sub, preserve_index=False)
             if parquet_path is None or station_slug is None:
@@ -223,7 +232,17 @@ def stream_filter_to_disk(
 def load_filtered_dataset(parquet_path: Path) -> pd.DataFrame:
     """Load the filtered dataset produced by :func:`stream_filter_to_disk`."""
 
-    cols_to_read = ["yday_frac_solar", "hour_solar", "T_C", "RH", "LON", "delta_utc_solar_h", "LAT"]
+    cols_to_read = [
+        "STATION_CODE",
+        "STATION_NAME",
+        "DT_UTC",
+        "T",
+        "RH",
+        "P",
+        "LON",
+        "LAT",
+        "ALTI",
+    ]
 
     if not parquet_path.exists():
         raise FileNotFoundError(f"No filtered dataset found at {parquet_path}")

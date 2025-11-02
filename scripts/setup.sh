@@ -3,7 +3,6 @@
 # scripts/setup.sh
 # Prepare a local development environment for the "harmoclimate" project.
 # - create .venv
-# - install torch from the PyTorch CPU index
 # - install the project (pyproject.toml) in editable mode
 #
 # Usage:
@@ -13,8 +12,6 @@ set -e
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="$PROJECT_ROOT/.venv"
-
-PYTORCH_INDEX="https://download.pytorch.org/whl/cpu"
 
 # 1) Find python3
 if command -v python3 >/dev/null 2>&1; then
@@ -40,11 +37,7 @@ source "$VENV_DIR/bin/activate"
 echo "➡️  Upgrading pip inside the virtual environment…"
 pip install --upgrade pip
 
-# 5) Install torch from the PyTorch CPU index
-echo "➡️  Installing torch (CPU) from $PYTORCH_INDEX …"
-pip install --index-url "$PYTORCH_INDEX" torch
-
-# 6) Install the project (editable)
+# 5) Install the project (editable)
 echo "➡️  Installing the project in editable mode…"
 pip install -e "$PROJECT_ROOT"
 

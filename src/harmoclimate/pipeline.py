@@ -10,10 +10,14 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .config import (
-    DATA_DIR,
-    GENERATED_DIR,
-    MODEL_DIR,
+    ANNUAL_HARMONICS_PER_PARAM,
     COUNTRY_CODE,
+    DATA_DIR,
+    DEFAULT_ANNUAL_HARMONICS,
+    GENERATED_DIR,
+    MEDIA_DIR,
+    MODEL_DIR,
+    N_DIURNAL_HARMONICS,
     STATION_CODE,
     TEMPLATE_DIR,
     ArtifactPaths,
@@ -24,12 +28,46 @@ from .config import (
 from .data_ingest import StationRecord, StreamResult, load_filtered_dataset, stream_filter_to_disk
 from .metadata import StationMetadata, summarize_station
 from .template_cpp import generate_cpp_header
-from .training import build_parameter_bundle, train_models
+from .training import build_parameter_payload, train_models
+from .display import (
+    load_linear_model,
+    model_daily_stats_one_year_factorized,
+    plot_year_pressure,
+    plot_year_specific_humidity,
+    plot_year_temperature,
+)
+
+
+_TARGET_SUFFIXES = {
+    "T": "_temperature",
+    "Q": "_specific_humidity",
+    "P": "_pressure",
+}
 
 
 def ensure_directories() -> None:
-    for path in (GENERATED_DIR, DATA_DIR, MODEL_DIR, TEMPLATE_DIR):
+    for path in (GENERATED_DIR, DATA_DIR, MODEL_DIR, TEMPLATE_DIR, MEDIA_DIR):
         path.mkdir(parents=True, exist_ok=True)
+
+
+def clean_pipeline() -> list[Path]:
+    """Remove cached Parquet datasets under the generated data directory."""
+
+    if not DATA_DIR.exists():
+        print(f"[Info] Data directory {DATA_DIR} does not exist; nothing to clean.")
+        return []
+
+    removed: list[Path] = []
+    for parquet_path in DATA_DIR.rglob("*.parquet"):
+        if parquet_path.is_file():
+            parquet_path.unlink()
+            removed.append(parquet_path)
+            print(f"[OK] Removed {parquet_path}")
+
+    if not removed:
+        print(f"[Info] No Parquet files found under {DATA_DIR}.")
+
+    return removed
 
 
 def _finalize_pipeline(
@@ -39,7 +77,7 @@ def _finalize_pipeline(
     station_records: Iterable[StationRecord],
     station_name: str,
     station_code: str | None,
-) -> tuple[StationMetadata, float, float]:
+) -> StationMetadata:
     """Train models, export artefacts, and summarise metadata."""
 
     station_meta = summarize_station(station_records, df, fallback_name=station_name)
@@ -56,10 +94,42 @@ def _finalize_pipeline(
     if station_meta.station_code:
         print(f"[Info] Station code           = {station_meta.station_code}")
 
-    result = train_models(df)
+    result = train_models(
+        df,
+        n_diurnal=N_DIURNAL_HARMONICS,
+        default_n_annual=DEFAULT_ANNUAL_HARMONICS,
+        annual_per_param=ANNUAL_HARMONICS_PER_PARAM,
+    )
 
-    print(f"Global MAE Temperature : {result.metrics_temperature.mae:.2f} °C")
-    print(f"Global MAE Humidity    : {result.metrics_humidity.mae:.2f} %")
+    temp_metrics = result.temperature_model.metrics
+    q_metrics = result.specific_humidity_model.metrics
+    p_metrics = result.pressure_model.metrics
+
+    print(f"Global MAE Temperature       : {temp_metrics.mae:.2f} °C")
+    print(f"Global MAE Specific Humidity : {q_metrics.mae:.4f} kg/kg")
+    print(f"Global MAE Pressure          : {p_metrics.mae:.2f} hPa")
+
+    source_data_utc_start = None
+    source_data_utc_end = None
+    if "DT_UTC" in df.columns:
+        dt_series = df["DT_UTC"].dropna()
+
+        def _iso_utc(value) -> str | None:
+            if value is None:
+                return None
+            if hasattr(value, "to_pydatetime"):
+                value = value.to_pydatetime()
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                else:
+                    value = value.astimezone(timezone.utc)
+                return value.isoformat()
+            return None
+
+        if not dt_series.empty:
+            source_data_utc_start = _iso_utc(dt_series.min())
+            source_data_utc_end = _iso_utc(dt_series.max())
 
     metadata_payload = {
         "station_code": station_meta.station_code,
@@ -68,20 +138,41 @@ def _finalize_pipeline(
         "latitude_deg": station_meta.latitude_deg,
         "altitude_m": station_meta.altitude_m,
         "delta_utc_solar_h": station_meta.delta_utc_solar_h,
-        "metrics": {
-            "temperature": result.metrics_temperature.as_dict(),
-            "relative_humidity": result.metrics_humidity.as_dict(),
-        },
+        "source_data_utc_start": source_data_utc_start,
+        "source_data_utc_end": source_data_utc_end,
     }
 
     generation_date = datetime.now(timezone.utc).isoformat()
-    params = build_parameter_bundle(result, metadata_payload, generation_date)
+    model_fits = {
+        "T": result.temperature_model,
+        "Q": result.specific_humidity_model,
+        "P": result.pressure_model,
+    }
 
-    with open(artifact_paths.model_json, "w", encoding="utf-8") as handle:
-        json.dump(params, handle, indent=2)
-    print(f"[OK] Parameters exported to {artifact_paths.model_json}")
+    payloads: dict[str, dict] = {}
+    artifact_paths.model_temperature_json.parent.mkdir(parents=True, exist_ok=True)
+    for target, model in model_fits.items():
+        payload = build_parameter_payload(model, metadata_payload, generation_date)
+        payloads[target] = payload
 
-    generate_cpp_header(params, artifact_paths.cpp_header)
+    path_map = {
+        "T": artifact_paths.model_temperature_json,
+        "Q": artifact_paths.model_specific_humidity_json,
+        "P": artifact_paths.model_pressure_json,
+    }
+
+    for target, payload in payloads.items():
+        path = path_map[target]
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        print(f"[OK] {payload['metadata']['target_variable']} parameters exported to {path}")
+
+    generate_cpp_header(
+        payloads["T"],
+        payloads["Q"],
+        payloads["P"],
+        artifact_paths.cpp_header,
+    )
 
     return station_meta
 
@@ -140,11 +231,83 @@ def _slug_from_model_path(model_path: Path) -> str:
     basename = model_path.stem
     expected_prefix = f"{COUNTRY_CODE.lower()}_"
     if basename.startswith(expected_prefix):
-        return basename[len(expected_prefix) :]
+        basename = basename[len(expected_prefix) :]
+
+    for suffix in _TARGET_SUFFIXES.values():
+        if basename.endswith(suffix):
+            basename = basename[: -len(suffix)]
+            break
+
     return basename
 
 
-def run_pipeline(station_code: str = STATION_CODE, urls: Sequence[str] | None = None) -> tuple[StationMetadata, float, float]:
+def _apply_model_path_override(
+    base_paths: ArtifactPaths,
+    model_path: Path,
+    target_variable: str,
+) -> ArtifactPaths:
+    """Return artefact paths overriding model JSON locations when needed."""
+
+    suffix = _TARGET_SUFFIXES.get(target_variable)
+    detected_target = target_variable
+    if suffix is None:
+        for candidate_target, candidate_suffix in _TARGET_SUFFIXES.items():
+            if model_path.stem.endswith(candidate_suffix):
+                detected_target = candidate_target
+                suffix = candidate_suffix
+                break
+        else:
+            suffix = ""
+
+    stem = model_path.stem
+    base_stem = stem[:-len(suffix)] if suffix and stem.endswith(suffix) else stem
+
+    model_dir = model_path.parent
+    derived_paths = {
+        target: model_dir / f"{base_stem}{suffix_value}{model_path.suffix}"
+        for target, suffix_value in _TARGET_SUFFIXES.items()
+    }
+    derived_paths[detected_target] = model_path
+
+    if (
+        derived_paths["T"] == base_paths.model_temperature_json
+        and derived_paths["Q"] == base_paths.model_specific_humidity_json
+        and derived_paths["P"] == base_paths.model_pressure_json
+    ):
+        return base_paths
+
+    return ArtifactPaths(
+        parquet=base_paths.parquet,
+        model_temperature_json=derived_paths["T"],
+        model_specific_humidity_json=derived_paths["Q"],
+        model_pressure_json=derived_paths["P"],
+        cpp_header=base_paths.cpp_header,
+    )
+
+
+def _normalize_model_basename(candidate: str) -> str:
+    """Return the canonical model basename (e.g. fr_bourges) from user input."""
+
+    name = Path(candidate).name
+    if name.endswith(".json"):
+        name = name[:-5]
+
+    for suffix in _TARGET_SUFFIXES.values():
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+
+    prefix = f"{COUNTRY_CODE.lower()}_"
+    if name.startswith(prefix):
+        return name
+
+    slug = slugify_station_name(name)
+    if not slug:
+        raise ValueError(f"Unable to derive station slug from model name '{candidate}'.")
+    return f"{prefix}{slug}"
+
+
+def run_pipeline(station_code: str = STATION_CODE, urls: Sequence[str] | None = None) -> StationMetadata:
     """Execute the full training, export, and template generation workflow."""
 
     ensure_directories()
@@ -163,13 +326,13 @@ def run_pipeline(station_code: str = STATION_CODE, urls: Sequence[str] | None = 
     )
 
 
-def generate_pipeline(station_code: str) -> tuple[StationMetadata, float, float]:
+def generate_pipeline(station_code: str) -> StationMetadata:
     """Fetch remote data for a station code and run the end-to-end pipeline."""
 
     return run_pipeline(station_code=station_code)
 
 
-def regenerate_pipeline(model_json: str | Path) -> tuple[StationMetadata, float, float]:
+def regenerate_pipeline(model_json: str | Path) -> StationMetadata:
     """Rebuild artefacts from a cached dataset based on an existing model JSON."""
 
     ensure_directories()
@@ -179,6 +342,7 @@ def regenerate_pipeline(model_json: str | Path) -> tuple[StationMetadata, float,
         payload = json.load(handle)
 
     metadata = payload.get("metadata", {})
+    target_variable_raw = str(metadata.get("target_variable") or "").strip()
     station_code_raw = metadata.get("station_code")
     station_code = str(station_code_raw).strip() if station_code_raw is not None else None
     if station_code == "":
@@ -191,12 +355,17 @@ def regenerate_pipeline(model_json: str | Path) -> tuple[StationMetadata, float,
 
     artifact_paths = build_artifact_paths(station_slug_hint)
 
-    if artifact_paths.model_json != model_path:
-        artifact_paths = ArtifactPaths(
-            parquet=artifact_paths.parquet,
-            model_json=model_path,
-            cpp_header=artifact_paths.cpp_header,
-        )
+    if target_variable_raw in _TARGET_SUFFIXES:
+        target_variable = target_variable_raw
+    else:
+        detected = None
+        for candidate_target, candidate_suffix in _TARGET_SUFFIXES.items():
+            if model_path.stem.endswith(candidate_suffix):
+                detected = candidate_target
+                break
+        target_variable = detected or "T"
+
+    artifact_paths = _apply_model_path_override(artifact_paths, model_path, target_variable)
 
     station_records: list[StationRecord] = []
 
@@ -216,6 +385,7 @@ def regenerate_pipeline(model_json: str | Path) -> tuple[StationMetadata, float,
             station_code=station_code,
         )
         artifact_paths = build_artifact_paths(stream_result.station_slug)
+        artifact_paths = _apply_model_path_override(artifact_paths, model_path, target_variable)
         df = load_filtered_dataset(artifact_paths.parquet)
         station_records.extend(stream_result.station_records)
         station_name = stream_result.station_name
@@ -229,4 +399,135 @@ def regenerate_pipeline(model_json: str | Path) -> tuple[StationMetadata, float,
     )
 
 
-__all__ = ["ensure_directories", "run_pipeline", "generate_pipeline", "regenerate_pipeline"]
+def display_pipeline(model_json: str | Path) -> Path:
+    """Render a yearly plot for a single target model and save it under generated/media."""
+
+    ensure_directories()
+
+    model_path = _resolve_model_path(model_json)
+    base_payload = load_linear_model(model_path)
+
+    metadata = base_payload.get("metadata", {})
+    station_name = str(
+        metadata.get("station_usual_name")
+        or metadata.get("station_name")
+        or metadata.get("station_code")
+        or ""
+    ).strip()
+    if not station_name:
+        station_name = _slug_from_model_path(model_path).replace("_", " ").title()
+
+    station_slug = slugify_station_name(station_name)
+    if not station_slug:
+        station_slug = _slug_from_model_path(model_path)
+
+    artifact_paths = build_artifact_paths(station_slug)
+
+    target_variable_raw = str(metadata.get("target_variable") or "").strip().upper()
+    if target_variable_raw in _TARGET_SUFFIXES:
+        target_variable = target_variable_raw
+    else:
+        detected = None
+        for candidate_target, candidate_suffix in _TARGET_SUFFIXES.items():
+            if model_path.stem.endswith(candidate_suffix):
+                detected = candidate_target
+                break
+        target_variable = detected or "T"
+
+    artifact_paths = _apply_model_path_override(artifact_paths, model_path, target_variable)
+
+    model_map = {
+        "T": artifact_paths.model_temperature_json,
+        "Q": artifact_paths.model_specific_humidity_json,
+        "P": artifact_paths.model_pressure_json,
+    }
+
+    payloads = {}
+    for key, path in model_map.items():
+        if key == target_variable:
+            payloads[key] = base_payload
+            continue
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Missing required model JSON for target '{key}' at {path}. "
+                "Run the generate pipeline first."
+            )
+        payloads[key] = load_linear_model(path)
+
+    (
+        days,
+        Tmin,
+        Tmax,
+        Tavg,
+        Qmin,
+        Qmax,
+        Qavg,
+        Pmin,
+        Pmax,
+        Pavg,
+    ) = model_daily_stats_one_year_factorized(
+        payloads["T"],
+        payloads["Q"],
+        payloads["P"],
+    )
+
+    target_path = model_map[target_variable]
+    media_path = MEDIA_DIR / f"{target_path.stem}.png"
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+    if target_variable == "T":
+        plot_year_temperature(days, Tmin, Tmax, Tavg, station_name, media_path)
+    elif target_variable == "Q":
+        plot_year_specific_humidity(days, Qmin, Qmax, Qavg, station_name, media_path)
+    else:
+        plot_year_pressure(days, Pmin, Pmax, Pavg, station_name, media_path)
+
+    return media_path
+
+
+def template_pipeline(model_name: str, target_language: str) -> Path:
+    """Generate an embedded template for an existing model bundle."""
+
+    ensure_directories()
+
+    basename = _normalize_model_basename(model_name)
+    language = target_language.strip().lower()
+
+    if language != "cpp":
+        raise ValueError(f"Unsupported target language '{target_language}'. Only 'cpp' is available.")
+
+    temperature_path = MODEL_DIR / f"{basename}{_TARGET_SUFFIXES['T']}.json"
+    specific_humidity_path = MODEL_DIR / f"{basename}{_TARGET_SUFFIXES['Q']}.json"
+    pressure_path = MODEL_DIR / f"{basename}{_TARGET_SUFFIXES['P']}.json"
+
+    if not temperature_path.exists():
+        raise FileNotFoundError(f"Missing temperature model JSON at {temperature_path}.")
+    if not specific_humidity_path.exists():
+        raise FileNotFoundError(f"Missing specific humidity model JSON at {specific_humidity_path}.")
+    if not pressure_path.exists():
+        raise FileNotFoundError(f"Missing pressure model JSON at {pressure_path}.")
+
+    temperature_payload = load_linear_model(temperature_path)
+    specific_humidity_payload = load_linear_model(specific_humidity_path)
+    pressure_payload = load_linear_model(pressure_path)
+
+    header_path = TEMPLATE_DIR / f"{basename}.hpp"
+    generate_cpp_header(
+        temperature_payload,
+        specific_humidity_payload,
+        pressure_payload,
+        header_path,
+    )
+
+    return header_path
+
+
+__all__ = [
+    "ensure_directories",
+    "clean_pipeline",
+    "run_pipeline",
+    "generate_pipeline",
+    "regenerate_pipeline",
+    "display_pipeline",
+    "template_pipeline",
+]

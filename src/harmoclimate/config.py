@@ -9,9 +9,14 @@ from pathlib import Path
 COUNTRY_CODE = "fr"
 MODEL_VERSION = "1.0"
 STATION_CODE = "18033001"
+AUTHOR_NAME = "HarmoClimate"
 
 CHUNK_SIZE = 200_000
-RANDOM_SEED = 42
+
+# ----------------------------- Model configuration -----------------------------
+N_DIURNAL_HARMONICS = 3
+DEFAULT_ANNUAL_HARMONICS = 3
+ANNUAL_HARMONICS_PER_PARAM: dict[str, int] = {}
 
 
 def slugify_station_name(name: str) -> str:
@@ -32,7 +37,9 @@ class ArtifactPaths:
     """Resolved filesystem paths for generated artefacts."""
 
     parquet: Path
-    model_json: Path
+    model_temperature_json: Path
+    model_specific_humidity_json: Path
+    model_pressure_json: Path
     cpp_header: Path
 
 
@@ -42,6 +49,7 @@ GENERATED_DIR = PROJECT_ROOT / "generated"
 DATA_DIR = GENERATED_DIR / "data"
 MODEL_DIR = GENERATED_DIR / "models"
 TEMPLATE_DIR = GENERATED_DIR / "templates"
+MEDIA_DIR = GENERATED_DIR / "media"
 
 
 def build_artifact_paths(station_slug: str) -> ArtifactPaths:
@@ -50,7 +58,9 @@ def build_artifact_paths(station_slug: str) -> ArtifactPaths:
     basename = compute_output_basename(station_slug)
     return ArtifactPaths(
         parquet=DATA_DIR / f"{basename}.parquet",
-        model_json=MODEL_DIR / f"{basename}.json",
+        model_temperature_json=MODEL_DIR / f"{basename}_temperature.json",
+        model_specific_humidity_json=MODEL_DIR / f"{basename}_specific_humidity.json",
+        model_pressure_json=MODEL_DIR / f"{basename}_pressure.json",
         cpp_header=TEMPLATE_DIR / f"{basename}.hpp",
     )
 
@@ -96,17 +106,21 @@ SAMPLES_PER_DAY = 96
 
 __all__ = [
     "ArtifactPaths",
+    "AUTHOR_NAME",
+    "ANNUAL_HARMONICS_PER_PARAM",
+    "DEFAULT_ANNUAL_HARMONICS",
     "CHUNK_SIZE",
     "COUNTRY_CODE",
     "DATA_DIR",
     "GENERATED_DIR",
+    "MEDIA_DIR",
     "MODEL_DIR",
     "MODEL_VERSION",
     "PROJECT_ROOT",
-    "RANDOM_SEED",
     "SAMPLES_PER_DAY",
     "STATION_CODE",
     "TEMPLATE_DIR",
+    "N_DIURNAL_HARMONICS",
     "URLS",
     "build_artifact_paths",
     "build_department_urls",

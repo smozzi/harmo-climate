@@ -1,21 +1,16 @@
-"""Model definitions and training utilities for HarmoClimate."""
+"""Linear harmonic model fitting utilities for HarmoClimate."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Iterable, List
 
 import numpy as np
 import pandas as pd
-import torch
-from torch import nn
 
-from .config import COUNTRY_CODE, MODEL_VERSION, RANDOM_SEED
-
-
-def _to_float_state_dict(module: nn.Module) -> Dict[str, float]:
-    return {k: float(v.detach().cpu().numpy()) for k, v in module.state_dict().items()}
+from .config import AUTHOR_NAME, COUNTRY_CODE, MODEL_VERSION
+from .core import SOLAR_YEAR_DAYS, compute_solar_time, specific_humidity_kg_per_kg
 
 
 @dataclass
@@ -36,98 +31,56 @@ class ErrorMetrics:
         }
 
 
-class AnnualHarmonic(nn.Module):
-    """Very light annual harmonic model."""
+@dataclass
+class ParameterLayout:
+    """Describes how a slice of the coefficient vector maps to a model parameter."""
 
-    def __init__(self, mu=10.0, A1=5.0, ph1=0.0, A2=1.0, ph2=1.0):
-        super().__init__()
-        self.mu = nn.Parameter(torch.tensor(mu, dtype=torch.float32))
-        self.A1 = nn.Parameter(torch.tensor(A1, dtype=torch.float32))
-        self.ph1 = nn.Parameter(torch.tensor(ph1, dtype=torch.float32))
-        self.A2 = nn.Parameter(torch.tensor(A2, dtype=torch.float32))
-        self.ph2 = nn.Parameter(torch.tensor(ph2, dtype=torch.float32))
+    name: str
+    role: str
+    n_annual: int
+    start: int
+    length: int
 
-    def forward(self, day: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        wA = 2.0 * math.pi / 365.0
-        th = wA * day
-        return self.mu + self.A1 * torch.cos(th - self.ph1) + self.A2 * torch.cos(2.0 * th - self.ph2)
-
-
-class DiurnalConditioned(nn.Module):
-    """Diurnal temperature offset model in solar time."""
-
-    def __init__(self):
-        super().__init__()
-        self.a0 = nn.Parameter(torch.tensor(4.0, dtype=torch.float32))
-        self.a1 = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.psiA = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        self.ph0 = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        self.k1 = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
-        self.psiP = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        self.alpha = nn.Parameter(torch.tensor(0.2, dtype=torch.float32))
-
-    def forward(self, day: torch.Tensor, hour: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        two_pi = 2.0 * math.pi
-        wA = two_pi / 365.0
-        wD = two_pi / 24.0
-        thA = wA * day
-        thD = wD * hour
-
-        Aday = self.a0 + self.a1 * torch.cos(thA - self.psiA)
-        phday = self.ph0 + self.k1 * torch.cos(thA - self.psiP)
-
-        base = torch.cos(thD - phday)
-        sec = torch.cos(2.0 * (thD - phday))
-        return Aday * (base + self.alpha * sec)
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "name": self.name,
+            "role": self.role,
+            "n_annual": self.n_annual,
+            "start": self.start,
+            "length": self.length,
+        }
 
 
-class DiurnalHumidity(nn.Module):
-    """Diurnal humidity offset conditioned by temperature residual."""
+@dataclass
+class LinearModelFit:
+    """Fitted linear harmonic model for a single target variable."""
 
-    def __init__(self):
-        super().__init__()
-        self.core = DiurnalConditioned()
-        self.beta_c = nn.Parameter(torch.tensor(-0.05, dtype=torch.float32))
+    target_variable: str
+    target_unit: str
+    coefficients: np.ndarray
+    params_layout: List[ParameterLayout]
+    n_diurnal: int
+    default_n_annual: int
+    annual_per_param: Dict[str, int]
+    metrics: ErrorMetrics
 
-    def forward(self, day: torch.Tensor, hour: torch.Tensor, temp_res: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        base = self.core(day, hour)
-        return base + self.beta_c * temp_res
-
-
-def train_module(module: nn.Module, x, y, lr=5e-2, epochs=800, weight_decay=0.0) -> nn.Module:
-    module.train()
-    opt = torch.optim.Adam(module.parameters(), lr=lr, weight_decay=weight_decay)
-    loss_fn = nn.MSELoss()
-    for ep in range(1, epochs + 1):
-        opt.zero_grad()
-        pred = module(*x) if isinstance(x, tuple) else module(x)
-        loss = loss_fn(pred, y)
-        loss.backward()
-        opt.step()
-        if ep % 200 == 0:
-            print(f"[train] epoch={ep:4d} loss={loss.item():.5f}")
-    module.eval()
-    return module
+    def coefficients_list(self) -> List[float]:
+        return [float(v) for v in self.coefficients]
 
 
 @dataclass
 class TrainingResult:
-    """Bundle capturing fitted modules, evaluation metrics, and aggregates."""
+    """Bundle capturing linear models for temperature, specific humidity, and pressure."""
 
-    annual_T: AnnualHarmonic
-    annual_RH: AnnualHarmonic
-    diurn_T: DiurnalConditioned
-    diurn_RH: DiurnalHumidity
-    metrics_temperature: ErrorMetrics
-    metrics_humidity: ErrorMetrics
-    daily_aggregate: pd.DataFrame
+    temperature_model: LinearModelFit
+    specific_humidity_model: LinearModelFit
+    pressure_model: LinearModelFit
 
 
-def _compute_error_metrics(errors: torch.Tensor) -> ErrorMetrics:
-    """Compute MAE, bias, and 5/95th percentiles for a vector of errors."""
+def _compute_error_metrics(errors: np.ndarray) -> ErrorMetrics:
+    """Compute basic error diagnostics for residuals."""
 
-    errors_np = np.asarray(errors.detach().cpu().numpy(), dtype=np.float64)
-    valid = errors_np[np.isfinite(errors_np)]
+    valid = errors[np.isfinite(errors)]
     if valid.size == 0:
         return ErrorMetrics(mae=math.nan, bias=math.nan, err_p05=math.nan, err_p95=math.nan)
 
@@ -138,116 +91,246 @@ def _compute_error_metrics(errors: torch.Tensor) -> ErrorMetrics:
     return ErrorMetrics(mae=mae, bias=bias, err_p05=err_p05, err_p95=err_p95)
 
 
-def train_models(df: pd.DataFrame, random_seed: int = RANDOM_SEED) -> TrainingResult:
-    """Train the four harmonic modules from the filtered dataset."""
+def build_annual_basis(day: np.ndarray, n_annual: int) -> np.ndarray:
+    """Construct the annual harmonic basis (constant + cos/sin pairs)."""
 
-    df = df.copy()
-    df["day"] = df["yday_frac_solar"].astype(float).apply(math.floor).astype(np.float32)
-    df["hour"] = df["hour_solar"].astype(np.float32)
+    omega = 2.0 * math.pi / SOLAR_YEAR_DAYS
+    cols = [np.ones_like(day)]
+    for k in range(1, n_annual + 1):
+        cols.append(np.cos(k * omega * day))
+        cols.append(np.sin(k * omega * day))
+    return np.column_stack(cols)
 
-    daily = df.groupby("day").agg(T_daily=("T_C", "mean"), RH_daily=("RH", "mean")).reset_index()
 
-    torch.manual_seed(random_seed)
-    x_day = torch.from_numpy(daily["day"].to_numpy(np.float32))
-    y_Td = torch.from_numpy(daily["T_daily"].to_numpy(np.float32))
-    y_RHd = torch.from_numpy(daily["RH_daily"].to_numpy(np.float32))
+def _role_for_parameter(name: str) -> str:
+    if name == "c0":
+        return "offset"
+    if name.startswith("a"):
+        return f"diurnal_cos_{int(name[1:])}"
+    if name.startswith("b"):
+        return f"diurnal_sin_{int(name[1:])}"
+    raise ValueError(f"Unknown parameter name '{name}'")
 
-    annual_T = AnnualHarmonic(mu=float(y_Td.mean()), A1=5.0, ph1=0.0, A2=1.0, ph2=1.0)
-    annual_T = train_module(annual_T, x_day, y_Td, lr=5e-2, epochs=1000)
 
-    annual_RH = AnnualHarmonic(mu=float(y_RHd.mean()), A1=10.0, ph1=math.pi, A2=2.0, ph2=1.0)
-    annual_RH = train_module(annual_RH, x_day, y_RHd, lr=5e-2, epochs=1000)
+def build_global_linear_matrix(
+    df: pd.DataFrame,
+    *,
+    n_diurnal: int,
+    annual_per_param: Dict[str, int],
+    default_n_annual: int,
+    target: str,
+) -> tuple[np.ndarray, np.ndarray, List[Dict[str, int]]]:
+    """Construct the design matrix for the factorized linear model."""
 
-    all_day = torch.from_numpy(df["day"].to_numpy(np.float32))
-    all_hour = torch.from_numpy(df["hour"].to_numpy(np.float32))
-    T_all = torch.from_numpy(df["T_C"].to_numpy(np.float32))
-    RH_all = torch.from_numpy(df["RH"].to_numpy(np.float32))
+    required_cols = {"yday_frac_solar", "hour_solar", target}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise KeyError(f"Missing required columns for training: {sorted(missing)}")
 
-    with torch.no_grad():
-        annT_all = annual_T(all_day)
-        annRH_all = annual_RH(all_day)
+    local = df.copy()
+    local = local.dropna(subset=["yday_frac_solar", "hour_solar", target])
+    local["day"] = np.floor(local["yday_frac_solar"]).astype(float)
+    max_day_index = math.floor(SOLAR_YEAR_DAYS)
+    local.loc[local["day"] > max_day_index, "day"] = float(max_day_index)
+    local["hour"] = np.mod(local["hour_solar"].astype(float), 24.0)
 
-    T_res = T_all - annT_all
-    RH_res = RH_all - annRH_all
+    day = local["day"].to_numpy(dtype=float)
+    hour = local["hour"].to_numpy(dtype=float)
+    y = local[target].to_numpy(dtype=float)
 
-    diurn_T = DiurnalConditioned()
-    diurn_T = train_module(diurn_T, (all_day, all_hour), T_res, lr=1e-2, epochs=1200, weight_decay=1e-5)
+    omega = 2.0 * math.pi / 24.0
+    param_names: List[str] = ["c0"]
+    for m in range(1, n_diurnal + 1):
+        param_names.extend([f"a{m}", f"b{m}"])
 
-    diurn_RH = DiurnalHumidity()
-    diurn_RH = _train_diurnal_humidity(diurn_RH, all_day, all_hour, T_res, RH_res, lr=1e-2, epochs=2000)
+    X_blocks: List[np.ndarray] = []
+    params_meta: List[Dict[str, int]] = []
+    start_idx = 0
 
-    with torch.no_grad():
-        T_pred = annual_T(all_day) + diurn_T(all_day, all_hour)
-        RH_pred = annual_RH(all_day) + diurn_RH(all_day, all_hour, T_res)
-        temp_errors = (T_all - T_pred) * 10.0
-        rh_errors = RH_all - RH_pred
+    for name in param_names:
+        n_annual_param = annual_per_param.get(name, default_n_annual)
+        annual_basis = build_annual_basis(day, n_annual_param)
 
-    metrics_temperature = _compute_error_metrics(temp_errors)
-    metrics_humidity = _compute_error_metrics(rh_errors)
+        if name == "c0":
+            block = annual_basis
+        elif name.startswith("a"):
+            harmonic = int(name[1:])
+            block = annual_basis * np.cos(harmonic * omega * hour)[:, None]
+        elif name.startswith("b"):
+            harmonic = int(name[1:])
+            block = annual_basis * np.sin(harmonic * omega * hour)[:, None]
+        else:
+            raise ValueError(f"Unhandled parameter name '{name}'")
 
-    return TrainingResult(
-        annual_T=annual_T,
-        annual_RH=annual_RH,
-        diurn_T=diurn_T,
-        diurn_RH=diurn_RH,
-        metrics_temperature=metrics_temperature,
-        metrics_humidity=metrics_humidity,
-        daily_aggregate=daily,
+        X_blocks.append(block)
+        length = annual_basis.shape[1]
+        params_meta.append(
+            {
+                "name": name,
+                "n_annual": n_annual_param,
+                "start": start_idx,
+                "length": length,
+            }
+        )
+        start_idx += length
+
+    X = np.concatenate(X_blocks, axis=1)
+    return X, y, params_meta
+
+
+def _build_layout(meta: Iterable[Dict[str, int]], target_unit: str) -> List[ParameterLayout]:
+    layout: List[ParameterLayout] = []
+    for entry in meta:
+        name = entry["name"]
+        role = _role_for_parameter(name)
+        layout.append(
+            ParameterLayout(
+                name=name,
+                role=role,
+                n_annual=int(entry["n_annual"]),
+                start=int(entry["start"]),
+                length=int(entry["length"]),
+            )
+        )
+    return layout
+
+
+def _fit_linear_model(
+    df: pd.DataFrame,
+    *,
+    target_variable: str,
+    target_unit: str,
+    n_diurnal: int,
+    default_n_annual: int,
+    annual_per_param: Dict[str, int],
+) -> LinearModelFit:
+    X, y, params_meta = build_global_linear_matrix(
+        df,
+        n_diurnal=n_diurnal,
+        annual_per_param=annual_per_param,
+        default_n_annual=default_n_annual,
+        target=target_variable,
+    )
+
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    predictions = X @ coef
+    residuals = y - predictions
+
+    layout = _build_layout(params_meta, target_unit)
+    metrics = _compute_error_metrics(residuals)
+
+    return LinearModelFit(
+        target_variable=target_variable,
+        target_unit=target_unit,
+        coefficients=coef.astype(float),
+        params_layout=layout,
+        n_diurnal=n_diurnal,
+        default_n_annual=default_n_annual,
+        annual_per_param=dict(annual_per_param),
+        metrics=metrics,
     )
 
 
-def _train_diurnal_humidity(
-    module: DiurnalHumidity,
-    day: torch.Tensor,
-    hour: torch.Tensor,
-    temp_res: torch.Tensor,
-    rh_res: torch.Tensor,
-    lr: float = 1e-2,
-    epochs: int = 2000,
-) -> DiurnalHumidity:
-    module.train()
-    opt = torch.optim.Adam(module.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
-    for ep in range(1, epochs + 1):
-        opt.zero_grad()
-        pred = module(day, hour, temp_res)
-        loss = loss_fn(pred, rh_res)
-        loss.backward()
-        opt.step()
-        if ep % 200 == 0:
-            print(f"[train RH] epoch={ep:4d} loss={loss.item():.5f}")
-    module.eval()
-    return module
+def train_models(
+    df: pd.DataFrame,
+    *,
+    n_diurnal: int = 3,
+    default_n_annual: int = 3,
+    annual_per_param: Dict[str, int] | None = None,
+) -> TrainingResult:
+    """Fit linear harmonic models for temperature, specific humidity, and pressure."""
+
+    annual_per_param = dict(annual_per_param or {})
+    working = df.copy()
+    if "DT_UTC" not in working.columns or "LON" not in working.columns:
+        raise KeyError("Dataset must include 'DT_UTC' and 'LON' columns for solar-time features.")
+    if "P" not in working.columns:
+        raise KeyError("Dataset is missing pressure column 'P'.")
+
+    solar_time = compute_solar_time(working["DT_UTC"], working["LON"])
+    for column in solar_time.columns:
+        working[column] = solar_time[column]
+
+    working["Q"] = specific_humidity_kg_per_kg(working["T"], working["RH"], working["P"])
+
+    temperature_model = _fit_linear_model(
+        working,
+        target_variable="T",
+        target_unit="degC",
+        n_diurnal=n_diurnal,
+        default_n_annual=default_n_annual,
+        annual_per_param=annual_per_param,
+    )
+
+    specific_humidity_model = _fit_linear_model(
+        working,
+        target_variable="Q",
+        target_unit="kg/kg",
+        n_diurnal=n_diurnal,
+        default_n_annual=default_n_annual,
+        annual_per_param=annual_per_param,
+    )
+
+    pressure_model = _fit_linear_model(
+        working,
+        target_variable="P",
+        target_unit="hPa",
+        n_diurnal=n_diurnal,
+        default_n_annual=default_n_annual,
+        annual_per_param=annual_per_param,
+    )
+
+    return TrainingResult(
+        temperature_model=temperature_model,
+        specific_humidity_model=specific_humidity_model,
+        pressure_model=pressure_model,
+    )
 
 
-def build_parameter_bundle(
-    result: TrainingResult,
+def build_parameter_payload(
+    model: LinearModelFit,
     metadata: Dict[str, object],
     generation_date_utc: str,
 ) -> Dict[str, object]:
-    """Assemble the JSON-friendly payload exported by the pipeline."""
+    """Build the JSON-friendly payload for a single fitted model."""
 
-    params = {
+    payload = {
         "metadata": {
             "version": MODEL_VERSION,
             "generated_at_utc": generation_date_utc,
             "country_code": COUNTRY_CODE,
+            "author": AUTHOR_NAME,
+            "target_variable": model.target_variable,
+            "target_unit": model.target_unit,
             **metadata,
         },
-        "annual_T": _to_float_state_dict(result.annual_T),
-        "annual_RH": _to_float_state_dict(result.annual_RH),
-        "diurn_T": _to_float_state_dict(result.diurn_T),
-        "diurn_RH": _to_float_state_dict(result.diurn_RH),
+        "model": {
+            "n_diurnal": model.n_diurnal,
+            "params_layout": [entry.as_dict() for entry in model.params_layout],
+            "coefficients": model.coefficients_list(),
+        },
     }
-    return params
+    payload["metadata"]["error_envelope"] = {
+        "mae": model.metrics.mae,
+        "bias": model.metrics.bias,
+        "p05": model.metrics.err_p05,
+        "p95": model.metrics.err_p95,
+    }
+    payload["metadata"]["time_basis"] = {
+        "type": "solar",
+        "days": SOLAR_YEAR_DAYS,
+        "calendar": "no-leap",
+    }
+    return payload
 
 
 __all__ = [
     "ErrorMetrics",
-    "AnnualHarmonic",
-    "DiurnalConditioned",
-    "DiurnalHumidity",
+    "ParameterLayout",
+    "LinearModelFit",
     "TrainingResult",
-    "build_parameter_bundle",
+    "build_annual_basis",
+    "build_global_linear_matrix",
+    "build_parameter_payload",
     "train_models",
 ]

@@ -49,7 +49,10 @@ def summarize_station(
     latitude_deg = _mean_or_nan(lat_values) if lat_values else float(df["LAT"].mean())
     altitude_m = _mean_or_nan(alti_values) if alti_values else float(df["ALTI"].mean())
 
-    delta_utc_solar_h = _mean_or_nan(delta_values) if delta_values else float(df["delta_utc_solar_h"].mean())
+    if delta_values:
+        delta_utc_solar_h = _mean_or_nan(delta_values)
+    else:
+        delta_utc_solar_h = float(df["LON"].mean() / 15.0)
 
     station_name = name_values[0] if name_values else (fallback_name or "Unknown station")
     station_code = code_values[0] if code_values else None

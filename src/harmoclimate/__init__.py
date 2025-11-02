@@ -1,10 +1,13 @@
 """HarmoClimate core package."""
 
 from .config import (
+    ANNUAL_HARMONICS_PER_PARAM,
+    AUTHOR_NAME,
     CHUNK_SIZE,
     COUNTRY_CODE,
+    DEFAULT_ANNUAL_HARMONICS,
     MODEL_VERSION,
-    RANDOM_SEED,
+    N_DIURNAL_HARMONICS,
     STATION_CODE,
     URLS,
     build_artifact_paths,
@@ -16,10 +19,13 @@ from .config import (
 )
 
 __all__ = [
+    "ANNUAL_HARMONICS_PER_PARAM",
+    "AUTHOR_NAME",
     "CHUNK_SIZE",
     "COUNTRY_CODE",
+    "DEFAULT_ANNUAL_HARMONICS",
     "MODEL_VERSION",
-    "RANDOM_SEED",
+    "N_DIURNAL_HARMONICS",
     "STATION_CODE",
     "URLS",
     "build_artifact_paths",
