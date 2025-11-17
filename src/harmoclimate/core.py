@@ -2,28 +2,63 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Iterable
+
 import numpy as np
 import pandas as pd
 
+from .psychrometrics import (
+    dew_or_frost_point_c_from_e,
+    relative_humidity_percent_from_specific,
+    specific_humidity_kg_per_kg,
+    thermo_from_T_P_RH,
+    vapor_partial_pressure_hpa_from_q_p,
+)
 SOLAR_YEAR_DAYS: float = 365.242189
 SOLAR_EPOCH_UTC = pd.Timestamp("2000-01-01 00:00:00", tz="UTC")
+DATASET_COLUMNS: tuple[str, ...] = (
+    "STATION_CODE",
+    "STATION_NAME",
+    "DT_UTC",
+    "T",
+    "RH",
+    "P",
+    "LON",
+    "LAT",
+    "ALTI",
+)
+_DERIVED_DATASET_COLUMNS: tuple[str, ...] = (
+    "yday_frac_solar",
+    "hour_solar",
+    "delta_utc_solar_h",
+    "Q",
+    "Td",
+    "E",
+)
+DEFAULT_PREPARED_COLUMNS: tuple[str, ...] = (
+    "DT_UTC",
+    "LON",
+    "T",
+    "RH",
+    "P",
+    *_DERIVED_DATASET_COLUMNS,
+)
 
 
-def specific_humidity_kg_per_kg(
-    temp_c: pd.Series | np.ndarray,
-    rh_percent: pd.Series | np.ndarray,
-    pressure_hpa: pd.Series | np.ndarray,
-) -> np.ndarray:
-    """Compute specific humidity (kg/kg) from temperature (°C), RH (%), and pressure (hPa)."""
+def load_parquet_dataset(parquet_path: Path) -> pd.DataFrame:
+    """Load a cached Parquet dataset and optionally constrain the returned columns."""
 
-    temp = np.asarray(temp_c, dtype=float)
-    rh = np.clip(np.asarray(rh_percent, dtype=float), 0.0, 100.0)
-    pressure = np.asarray(pressure_hpa, dtype=float)
+    if not parquet_path.exists():
+        raise FileNotFoundError(f"No Parquet dataset found at {parquet_path}")
 
-    saturation_pressure_hpa = 6.112 * np.exp((17.67 * temp) / (temp + 243.5))
-    vapor_pressure_hpa = (rh / 100.0) * saturation_pressure_hpa
-    denominator = np.maximum(pressure - 0.378 * vapor_pressure_hpa, 1e-6)
-    return 0.622 * vapor_pressure_hpa / denominator
+    df = pd.read_parquet(parquet_path)
+
+    missing = set(DATASET_COLUMNS) - set(df.columns)
+    if missing:
+        raise KeyError(f"Dataset at {parquet_path} is missing required columns: {sorted(missing)}")
+
+    return df
 
 
 def compute_solar_time(
@@ -84,52 +119,79 @@ def compute_solar_time(
         index=dt_series.index,
     )
 
-def relative_humidity_percent_from_specific(
-    temp_c: pd.Series | np.ndarray,
-    q_kg_per_kg: pd.Series | np.ndarray,
-    pressure_hpa: pd.Series | np.ndarray,
-) -> np.ndarray:
-    """Compute relative humidity (%) from temperature (°C), specific humidity (kg/kg), and pressure (hPa)."""
 
-    temp = np.asarray(temp_c, dtype=float)
-    q = np.asarray(q_kg_per_kg, dtype=float)
-    pressure = np.asarray(pressure_hpa, dtype=float)
+def prepare_dataset(
+    df: pd.DataFrame,
+    columns: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Return a dataset copy populated with derived solar descriptors and moist thermodynamics.
 
-    # saturation vapor pressure over water (Magnus-Tetens)
-    es_hpa = 6.112 * np.exp((17.67 * temp) / (temp + 243.5))
+    Args:
+        df: Raw station dataset containing at least the core meteorological columns.
+        columns: Optional iterable of column names to keep in the returned frame. Defaults to
+            `DEFAULT_PREPARED_COLUMNS`.
+    """
 
-    # actual vapor pressure from specific humidity
-    # q = 0.622 * e / (P - 0.378 e)  →  e = q P / (0.622 + 0.378 q)
-    numerator = q * pressure
-    denominator = 0.622 + 0.378 * q
-    e_hpa = numerator / np.maximum(denominator, 1e-6)
+    required = {"DT_UTC", "LON", "T", "RH", "P"}
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(f"Dataset is missing required columns: {sorted(missing)}")
 
-    rh = 100.0 * e_hpa / np.maximum(es_hpa, 1e-6)
-    return np.clip(rh, 0.0, 100.0)
+    working = df.copy()
+    working["DT_UTC"] = pd.to_datetime(working["DT_UTC"], utc=True, errors="coerce")
+    working["LON"] = pd.to_numeric(working["LON"], errors="coerce")
+    working = working.dropna(subset=["DT_UTC", "LON"])
 
-def dew_point_c_from_q_and_pressure(
-    q_kg_per_kg: pd.Series | np.ndarray,
-    pressure_hpa: pd.Series | np.ndarray,
-) -> np.ndarray:
-    """Compute dew point (°C) from specific humidity (kg/kg) and pressure (hPa)."""
+    available_base = set(working.columns)
+    derived_names = set(_DERIVED_DATASET_COLUMNS)
 
-    q = np.asarray(q_kg_per_kg, dtype=float)
-    p = np.asarray(pressure_hpa, dtype=float)
+    if columns is None:
+        requested = list(DEFAULT_PREPARED_COLUMNS)
+    else:
+        requested = list(columns)
 
-    # actual vapor pressure from specific humidity
-    # q = 0.622 * e / (P - 0.378 e)  →  e = q P / (0.622 + 0.378 q)
-    e_hpa = (q * p) / np.maximum(0.622 + 0.378 * q, 1e-6)
+    unknown = set(requested) - (available_base | derived_names)
+    if unknown:
+        raise KeyError(f"Requested columns are not available: {sorted(unknown)}")
 
-    alpha = np.log(np.maximum(e_hpa, 1e-6) / 6.112)
-    td = (243.5 * alpha) / (17.67 - alpha)
-    return td
+    solar_needed = any(name in requested for name in ("yday_frac_solar", "hour_solar", "delta_utc_solar_h"))
+    q_needed = any(name in requested for name in ("Q", "Td", "E"))
+    td_needed = "Td" in requested
+    e_needed = "E" in requested or td_needed
+
+    if solar_needed:
+        solar_time = compute_solar_time(working["DT_UTC"], working["LON"])
+        for column in solar_time.columns:
+            working[column] = solar_time[column]
+
+    if q_needed:
+        working["Q"] = specific_humidity_kg_per_kg(working["T"], working["RH"], working["P"])
+
+    if e_needed:
+        working["E"] = vapor_partial_pressure_hpa_from_q_p(working["Q"], working["P"])
+
+    if td_needed:
+        working["Td"] = dew_or_frost_point_c_from_e(working["E"])
+
+    # Ensure all requested columns exist before selection (e.g. derived but absent due to NaNs).
+    missing_requested = [name for name in requested if name not in working.columns]
+    if missing_requested:
+        raise KeyError(f"Unable to populate requested columns: {missing_requested}")
+
+    return working.loc[:, requested].copy()
 
 
 __all__ = [
     "SOLAR_YEAR_DAYS",
     "SOLAR_EPOCH_UTC",
+    "DATASET_COLUMNS",
     "specific_humidity_kg_per_kg",
     "compute_solar_time",
+    "load_parquet_dataset",
+    "prepare_dataset",
     "relative_humidity_percent_from_specific",
-    "dew_point_c_from_q_and_pressure"
+    "dew_or_frost_point_c_from_e",
+    "vapor_partial_pressure_hpa_from_q_p",
+    "thermo_from_T_P_RH",
 ]

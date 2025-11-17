@@ -16,7 +16,7 @@ dependencies = [
   "pandas>=2.1",
   "pyarrow>=12.0",
   "matplotlib>=3.7",
-  "ipywidgets>=8.0"
+  "water-sat-pressure-2p @ git+https://github.com/smozzi/water-saturation-pressure-2p.git@v0.1.0",
 ]
 
 [tool.setuptools]

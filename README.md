@@ -1,12 +1,14 @@
 # HarmoClimate Model Generator
 
-HarmoClimate is a suite of Python utilities that extract hourly weather observations for a single Météo-France station and generate **an ultralight, location-tuned climate baseline for hourly outdoor temperature, pressure and humidity.**
+**HarmoClimate generates ultralight, location-tuned climate baselines, producing hourly temperature, station pressure, and specific humidity with a compact harmonic model** from a Météo-France station history data.
 
-Code templates are provided to embed generated models in other applications and languages (for example C++), typically in a single file **without any additional dependencies.**
+**Embed anywhere with zero extra dependencies.** Code templates are provided (e.g., C++) to integrate a generated model as a single, self-contained file.
 
-The model deliberately uses a very small set of harmonic, so that each component can be inspected, understood, and manually adjusted if needed. It includes an error envelope based on historical observations to compare the model’s baseline output with real-world data.
+The model uses a small, explainable set of harmonics, so each component can be inspected and, if needed, manually adjusted. An historical error envelope (quantile band derived from observations) lets you compare the baseline to real world data.
 
-## Models Use Cases
+Robustness is assessed with Leave-One-Year-Out (LOYO) validation, holding out each year in turn and comparing RMSE for both the model and the historical mean climatology. The current bundle shows a typical positive LOYO skill of roughly +3% versus the historical mean baseline across the archived years.
+
+## Typical Use Cases
 
 - Estimate typical outdoor temperature and humidity cycles to support HVAC sizing, setpoint strategies, and lightweight energy simulations.
 - Embed a deterministic, low-footprint climate model in firmware for low-power or offline environmental monitoring devices.
@@ -31,8 +33,8 @@ The repository ships with several reference French weather stations that demonst
 
 - Streams historical hourly observations for a French department directly from public Météo-France archives.
 - Filters the source data down to a single station (configurable), normalises timestamps to UTC, and persists raw climatic fields; solar/orbital conversions are handled downstream by `harmoclimate.core`.
-- Fits configurable linear harmonic models for temperature (°C), specific humidity (kg/kg), and pressure (hPa) via least-squares regression.
-- Evaluates both fitted models with simple mean absolute error (MAE) metrics.
+- Fits configurable linear harmonic models for temperature (°C), specific humidity (kg/kg), and pressure (hPa) via least-squares regression, caching per-year sufficient statistics for fast leave-one-year-out (LOYO) sweeps.
+- Evaluates fitted models with a LOYO protocol against a no-leap UTC day/hour climatology (computed from all other years), capturing MAE envelopes plus per-year RMSE/skill metrics. Global LOYO RMSE/skill summaries are stored on each model JSON (`training_loyo_rmse`, `training_loyo_skill`), while detailed per-year reports live under `generated/models/training_metrics/`.
 - Exports one JSON parameter bundle per target and generates a self-contained C++ header for embedded use.
 - Provides optional visualisation helpers for comparing the generated model to historical climatology.
 
@@ -51,7 +53,7 @@ The repository ships with several reference French weather stations that demonst
 │       ├── pipeline.py              # End-to-end orchestration
 │       ├── template_cpp.py          # C++ header generation utilities
 │       ├── training.py              # Linear model assembly and training routines
-│       └── display.py               # Plotting and interactive inspection helpers
+│       └── display.py               # Plotting helpers for yearly and intraday charts
 ├── generated/
 │   ├── data/                        # Filtered datasets (Parquet)
 │   ├── models/                      # Exported JSON parameter bundles
@@ -112,8 +114,9 @@ The CLI exposes several workflows. All artefacts are written under `generated/{d
    - Filter rows matching the provided station code, normalise timestamps to UTC, and persist raw climatic + station metadata.
    - Persist the filtered dataset to `generated/data/{country_code}_{station_slug}.parquet`.
    - Fit the linear harmonic models for temperature (°C), specific humidity (kg/kg), and pressure (hPa).
-   - Report global MAE metrics for temperature, specific humidity, and pressure.
+   - Report error envelopes plus LOYO diagnostics (global RMSE and skill) for temperature, specific humidity, and pressure.
    - Export the learned parameters and metadata to `generated/models/{country_code}_{station_slug}_temperature.json`, `generated/models/{country_code}_{station_slug}_specific_humidity.json`, and `generated/models/{country_code}_{station_slug}_pressure.json`.
+   - Persist per-year LOYO metrics to `generated/models/training_metrics/{country_code}_{station_slug}_{target}_training_metrics.{json,csv}` and store the global RMSE/skill summaries on the model metadata (`training_loyo_rmse`, `training_loyo_skill`).
    - Generate a C++ header (`generated/templates/{country_code}_{station_slug}.hpp`) with inline prediction helpers.
 
 2. **Regenerate outputs from an existing model JSON.**
@@ -124,13 +127,18 @@ The CLI exposes several workflows. All artefacts are written under `generated/{d
    - Otherwise the pipeline re-streams the archives using the `station_code` stored in the JSON metadata.
    - Training, evaluation, and export steps mirror the `generate` command.
 
-3. **Render a yearly plot for an existing model.**
+3. **Render plots for an existing model.**
    ```bash
    python main.py display fr_bourges_temperature.json
    ```
-   - The command resolves the companion humidity and pressure models automatically and saves the figure to `generated/media/fr_bourges_temperature.png`.
-   - Use any generated model file (temperature, specific humidity, or pressure) as the argument to emit the corresponding plot.
-   - Specific humidity plots display values in g/kg (coefficients remain stored in kg/kg).
+   ```bash
+   python main.py display fr_bourges_temperature.json --mode intraday --day 42
+   ```
+- The default (`--mode=annual`) resolves the companion humidity and pressure models automatically and saves a composite figure (temperature, specific humidity in g/kg, and pressure) to `generated/media/fr_bourges_annual.png`.
+- Intraday mode renders a single-day solar-time profile (`generated/media/fr_bourges_intraday_100.png`) and requires the `--day` argument.
+- Pass `--variables <codes...>` to control which panels render. The default is `T Q P`; include `RH`, `TD`, or `E` when you also need relative humidity, dew point, or vapor pressure (e.g. `--variables T RH TD Q E P`).
+- Historical overlays appear in both annual and intraday plots whenever the cached Parquet dataset exists under `generated/data/`.
+- Specific humidity plots display values in g/kg (coefficients remain stored in kg/kg).
 
 4. **Generate an embedded template for existing models.**
    ```bash
@@ -147,17 +155,15 @@ The CLI exposes several workflows. All artefacts are written under `generated/{d
    - Deletes cached datasets stored under `generated/data/` so subsequent runs stream fresh data.
    - Leaves generated models, templates, and media artefacts untouched.
 
-6. **Render yearly plots for all generated models.**
+6. **Render plots for every generated model.**
    ```bash
    ./scripts/display_all.sh
    ```
-   - Iterates over every JSON bundle in `generated/models/` and calls `python main.py display` for each file.
-   - Recreates the companion figures under `generated/media/` so they stay in sync with regenerated models.
+   - Iterates over each station represented in `generated/models/`, using one bundle as the seed to render the annual composite figure via `python main.py display`.
+   - Immediately replays the command with `--mode intraday --day 100` (when a temperature bundle exists) so every station ships a matching solar-day profile.
+   - Stores the annual and intraday PNGs side by side under `generated/media/`, keeping the dashboard assets synchronized after retraining.
 
-7. **Optional visualisations.**
-   The `src/harmoclimate/display.py` module exposes functions to render yearly temperature, specific-humidity, and pressure curves or compare the model against historical climatology. Ensure `matplotlib` (and `ipywidgets` for interactive plots) is installed before calling these utilities.
-
-8. **Backwards-compatible default.**
+7. **Backwards-compatible default.**
    Running `python main.py` with no arguments still executes the pipeline using the `STATION_CODE` defined in `src/harmoclimate/config.py`. This is useful when scripting or when a default station is preferred.
 
 ## Generating a New Model

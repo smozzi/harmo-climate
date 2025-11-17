@@ -10,6 +10,7 @@ SRC_ROOT = Path(__file__).resolve().parent / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from harmoclimate.display import DISPLAY_VARIABLE_CHOICES  # noqa: E402
 from harmoclimate.pipeline import (  # noqa: E402
     clean_pipeline,
     display_pipeline,
@@ -44,11 +45,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     display_parser = subparsers.add_parser(
         "display",
-        help="Render a yearly plot for a target model JSON and save it under generated/media.",
+        help="Render a plot for a target model JSON and save it under generated/media.",
     )
     display_parser.add_argument(
         "model_json",
         help="Path or file name of a generated model JSON (e.g. fr_bourges_temperature.json).",
+    )
+    display_parser.add_argument(
+        "--mode",
+        choices=("annual", "intraday"),
+        default="annual",
+        help="Choose 'annual' for yearly envelopes or 'intraday' for a single solar day profile.",
+    )
+    display_parser.add_argument(
+        "--day",
+        type=int,
+        help="Solar day number (1-based) required when --mode=intraday.",
+    )
+    display_parser.add_argument(
+        "--variables",
+        nargs="+",
+        choices=DISPLAY_VARIABLE_CHOICES,
+        metavar="VAR",
+        help=(
+            "Ordered list of panel codes to render (choose from T, RH, TD, Q, E, P). "
+            "Defaults to T Q P when omitted."
+        ),
     )
 
     template_parser = subparsers.add_parser(
@@ -83,7 +105,12 @@ def main(argv: list[str] | None = None) -> int:
         regenerate_pipeline(args.model_json)
         return 0
     if args.command == "display":
-        display_pipeline(args.model_json)
+        display_pipeline(
+            args.model_json,
+            mode=args.mode,
+            day=args.day,
+            variables=args.variables,
+        )
         return 0
     if args.command == "template":
         template_pipeline(args.model_name, args.language)

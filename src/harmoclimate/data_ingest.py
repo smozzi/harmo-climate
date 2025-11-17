@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Tuple
+
 import pandas as pd
 
 try:
@@ -14,6 +15,7 @@ except ImportError as exc:  # pragma: no cover - execution stops before tests
     raise ImportError("pyarrow is required for HarmoClimate data ingestion.") from exc
 
 from .config import CHUNK_SIZE, STATION_CODE, build_artifact_paths, slugify_station_name
+from .core import DATASET_COLUMNS
 
 
 @dataclass
@@ -38,7 +40,7 @@ class StreamResult:
     station_slug: str
 
 
-def choose_columns(colnames: Iterable[str]) -> Tuple[str, str, str, str, str, str, str, str]:
+def choose_columns(colnames: Iterable[str]) -> Tuple[str, str, str, str, str, str, str, str, str]:
     """Validate the expected Meteo-France column names."""
 
     col_code = "NUM_POSTE"
@@ -142,8 +144,8 @@ def stream_filter_to_disk(
                 parquet_path.unlink(missing_ok=True)
 
             sub["dt_local"] = parse_dt_aaaammjjhh(sub[col_dt])
-            sub[col_T] = pd.to_numeric(sub[col_T], errors="coerce")
-            sub[col_U] = pd.to_numeric(sub[col_U], errors="coerce")
+            sub["T"] = pd.to_numeric(sub[col_T], errors="coerce")
+            sub["RH"] = pd.to_numeric(sub[col_U], errors="coerce")
             sub["LON"] = pd.to_numeric(sub[col_lon], errors="coerce")
             sub["LAT"] = pd.to_numeric(sub[col_lat], errors="coerce")
             sub["ALTI"] = pd.to_numeric(sub[col_alti], errors="coerce")
@@ -151,7 +153,7 @@ def stream_filter_to_disk(
             sub["STATION_CODE"] = code_series[mask].to_numpy()
             sub["STATION_NAME"] = sub[col_station].astype("string").str.strip()
 
-            sub = sub.dropna(subset=["dt_local", col_T, col_U, "LON", "LAT", "ALTI", "P"])
+            sub = sub.dropna(subset=["dt_local", "T", "RH", "LON", "LAT", "ALTI", "P"])
 
             sub["dt_local"] = sub["dt_local"].dt.tz_localize(
                 "Europe/Paris",
@@ -159,11 +161,9 @@ def stream_filter_to_disk(
                 ambiguous="NaT",
             )
             sub = sub.dropna(subset=["dt_local"])
-            sub["dt_utc"] = sub["dt_local"].dt.tz_convert("UTC")
-            sub["DT_UTC"] = sub["dt_utc"]
-
-            sub["T"] = sub[col_T].astype("float32")
-            sub["RH"] = sub[col_U].clip(0, 100).astype("float32")
+            sub["DT_UTC"] = sub["dt_local"].dt.tz_convert("UTC")
+            sub["T"] = sub["T"].astype("float32")
+            sub["RH"] = sub["RH"].clip(0, 100).astype("float32")
             sub["P"] = sub["P"].astype("float32")
             sub["LON"] = sub["LON"].astype("float32")
             sub["LAT"] = sub["LAT"].astype("float32")
@@ -181,27 +181,16 @@ def stream_filter_to_disk(
                 station_code_value = _normalize_station_code(row["STATION_CODE"])
                 station_records.append(
                     StationRecord(
+                        station_code=station_code_value or None,
                         station_name=name_str,
                         lon=lon_value,
                         lat=float(row["LAT"]),
                         alti=float(row["ALTI"]),
                         delta_utc_solar_h=lon_value / 15.0,
-                        station_code=station_code_value or None,
                     )
                 )
 
-            final_cols = [
-                "STATION_CODE",
-                "STATION_NAME",
-                "DT_UTC",
-                "T",
-                "RH",
-                "P",
-                "LON",
-                "LAT",
-                "ALTI",
-            ]
-            sub = sub[final_cols]
+            sub = sub[list(DATASET_COLUMNS)]
 
             table = pa.Table.from_pandas(sub, preserve_index=False)
             if parquet_path is None or station_slug is None:
@@ -229,34 +218,10 @@ def stream_filter_to_disk(
     )
 
 
-def load_filtered_dataset(parquet_path: Path) -> pd.DataFrame:
-    """Load the filtered dataset produced by :func:`stream_filter_to_disk`."""
-
-    cols_to_read = [
-        "STATION_CODE",
-        "STATION_NAME",
-        "DT_UTC",
-        "T",
-        "RH",
-        "P",
-        "LON",
-        "LAT",
-        "ALTI",
-    ]
-
-    if not parquet_path.exists():
-        raise FileNotFoundError(f"No filtered dataset found at {parquet_path}")
-
-    df = pd.read_parquet(parquet_path)
-
-    return df[cols_to_read]
-
-
 __all__ = [
     "StationRecord",
     "StreamResult",
     "choose_columns",
-    "load_filtered_dataset",
     "parse_dt_aaaammjjhh",
     "stream_filter_to_disk",
 ]

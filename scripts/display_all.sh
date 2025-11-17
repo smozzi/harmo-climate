@@ -28,8 +28,46 @@ if [[ ${#MODEL_FILES[@]} -eq 0 ]]; then
   exit 0
 fi
 
+declare -A STATION_ANNUAL=()
+declare -A STATION_TEMPERATURE=()
+
 for model_path in "${MODEL_FILES[@]}"; do
   model_name="$(basename "${model_path}")"
-  echo "[HarmoClimate] Rendering plot for ${model_name}"
-  "${PYTHON_BIN}" "${ROOT_DIR}/main.py" display "${model_path}"
+  station_key="${model_name%.json}"
+
+  if [[ "${model_name}" == *_temperature.json ]]; then
+    station_key="${model_name%_temperature.json}"
+    STATION_TEMPERATURE["${station_key}"]="${model_path}"
+    STATION_ANNUAL["${station_key}"]="${model_path}"
+    continue
+  elif [[ "${model_name}" == *_specific_humidity.json ]]; then
+    station_key="${model_name%_specific_humidity.json}"
+  elif [[ "${model_name}" == *_pressure.json ]]; then
+    station_key="${model_name%_pressure.json}"
+  fi
+
+  if [[ -z "${STATION_ANNUAL[${station_key}]+set}" ]]; then
+    STATION_ANNUAL["${station_key}"]="${model_path}"
+  fi
 done
+
+if [[ ${#STATION_ANNUAL[@]} -eq 0 ]]; then
+  echo "No model JSON files found in ${MODELS_DIR}" >&2
+  exit 0
+fi
+
+while IFS= read -r station; do
+  model_path="${STATION_ANNUAL[${station}]}"
+  model_name="$(basename "${model_path}")"
+  echo "[HarmoClimate] Rendering annual plot for ${station} (${model_name})"
+  "${PYTHON_BIN}" "${ROOT_DIR}/main.py" display "${model_path}"
+
+  temp_path="${STATION_TEMPERATURE[${station}]:-}"
+  if [[ -n "${temp_path}" ]]; then
+    temp_name="$(basename "${temp_path}")"
+    echo "[HarmoClimate] Rendering intraday plot (day 100) for ${station} (${temp_name})"
+    "${PYTHON_BIN}" "${ROOT_DIR}/main.py" display "${temp_path}" --mode intraday --day 100
+  else
+    echo "[HarmoClimate] Skipping intraday plot for ${station} (no temperature bundle found)"
+  fi
+done < <(printf "%s\n" "${!STATION_ANNUAL[@]}" | sort)

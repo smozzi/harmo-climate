@@ -19,8 +19,26 @@ if [[ ${#MODEL_FILES[@]} -eq 0 ]]; then
   exit 0
 fi
 
+declare -A processed_stations=()
+
 for model_path in "${MODEL_FILES[@]}"; do
   model_name="$(basename "${model_path}")"
-  echo "[HarmoClimate] Regenerating ${model_name}"
+  stem="${model_name%.json}"
+
+  base_slug="${stem}"
+  for suffix in "_temperature" "_specific_humidity" "_pressure"; do
+    if [[ "${base_slug}" == *"${suffix}" ]]; then
+      base_slug="${base_slug%${suffix}}"
+      break
+    fi
+  done
+
+  if [[ -n "${processed_stations["${base_slug}"]+yes}" ]]; then
+    continue
+  fi
+
+  processed_stations["${base_slug}"]=1
+
+  echo "[HarmoClimate] Regenerating ${base_slug} (via ${model_name})"
   python "${ROOT_DIR}/main.py" regenerate "${model_path}"
 done

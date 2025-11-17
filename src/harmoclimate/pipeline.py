@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 from dataclasses import replace
@@ -23,21 +24,31 @@ from .config import (
     ArtifactPaths,
     build_artifact_paths,
     build_urls_for_station,
+    compute_output_basename,
     slugify_station_name,
 )
-from .data_ingest import StationRecord, StreamResult, load_filtered_dataset, stream_filter_to_disk
+from .core import load_parquet_dataset
+from .data_ingest import StationRecord, StreamResult, stream_filter_to_disk
 from .metadata import StationMetadata, summarize_station
 from .template_cpp import generate_cpp_header
-from .training import build_parameter_payload, train_models
+from .evaluation import evaluate_loyo
+from .training import (
+    LinearModelFit,
+    RIDGE_LAMBDA_DEFAULT,
+    build_parameter_payload,
+    compute_sufficient_stats,
+    prepare_training_frame,
+    train_models,
+)
 from .display import (
+    historical_climatology_daily,
+    load_history_from_sample_data,
     load_linear_model,
     model_daily_stats_one_year_factorized,
-    plot_year_pressure,
-    plot_year_specific_humidity,
-    plot_year_temperature,
+    normalize_display_variables,
+    plot_intraday,
+    plot_year,
 )
-
-
 _TARGET_SUFFIXES = {
     "T": "_temperature",
     "Q": "_specific_humidity",
@@ -48,6 +59,71 @@ _TARGET_SUFFIXES = {
 def ensure_directories() -> None:
     for path in (GENERATED_DIR, DATA_DIR, MODEL_DIR, TEMPLATE_DIR, MEDIA_DIR):
         path.mkdir(parents=True, exist_ok=True)
+
+
+def _export_training_metrics_files(model: LinearModelFit, model_path: Path) -> None:
+    """Persist LOYO metrics alongside the primary model artefact."""
+
+    report = getattr(model, "validation", None)
+    if report is None:
+        return
+
+    metrics_dir = model_path.parent / "training_metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics_stem = f"{model_path.stem}_training_metrics"
+    metrics_json_path = metrics_dir / f"{metrics_stem}.json"
+    metrics_csv_path = metrics_dir / f"{metrics_stem}.csv"
+
+    payload = report.to_payload()
+
+    with open(metrics_json_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+    fieldnames = ["year", "rmse", "mse_model", "mse_ref", "skill", "n"]
+    with open(metrics_csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        if report.years:
+            for entry in report.years:
+                row = entry.as_dict()
+                writer.writerow(
+                    {
+                        "year": row["year"],
+                        "rmse": row["rmse"],
+                        "mse_model": row["mse_model"],
+                        "mse_ref": row["mse_ref"],
+                        "skill": row["skill"],
+                        "n": row["n"],
+                    }
+                )
+
+            total_n = sum(entry.n for entry in report.years)
+            if total_n > 0:
+                weighted_mse_model = sum(entry.n * entry.mse_model for entry in report.years)
+                weighted_mse_ref = sum(entry.n * entry.mse_ref for entry in report.years)
+                global_rmse = payload["global"]["rmse"]
+                global_skill = payload["global"]["skill"]
+                global_mse_model = weighted_mse_model / total_n
+                global_mse_ref = weighted_mse_ref / total_n
+                writer.writerow(
+                    {
+                        "year": "global",
+                        "rmse": global_rmse,
+                        "mse_model": global_mse_model,
+                        "mse_ref": global_mse_ref,
+                        "skill": global_skill,
+                        "n": total_n,
+                    }
+                )
+
+    if report.years:
+        print(f"[OK] LOYO metrics exported to {metrics_json_path} and {metrics_csv_path}")
+    else:
+        print(
+            "[Info] LOYO validation produced no per-year entries; "
+            f"exported summary scaffold to {metrics_json_path} and {metrics_csv_path}",
+        )
 
 
 def clean_pipeline() -> list[Path]:
@@ -94,12 +170,95 @@ def _finalize_pipeline(
     if station_meta.station_code:
         print(f"[Info] Station code           = {station_meta.station_code}")
 
+    prepared = prepare_training_frame(df)
+    ridge_lambda = RIDGE_LAMBDA_DEFAULT
+    annual_overrides = dict(ANNUAL_HARMONICS_PER_PARAM)
+
     result = train_models(
-        df,
+        prepared,
         n_diurnal=N_DIURNAL_HARMONICS,
         default_n_annual=DEFAULT_ANNUAL_HARMONICS,
-        annual_per_param=ANNUAL_HARMONICS_PER_PARAM,
+        annual_per_param=annual_overrides,
+        ridge_lambda=ridge_lambda,
     )
+
+    reference_template = {
+        "type": "climatology_mean",
+        "time_basis": "UTC",
+        "calendar": "no-leap",
+        "grouping": "utc_day_of_year × utc_hour",
+        "exclusion": "held-out year",
+        "hours_per_day": 24,
+        "days_per_year": 365,
+    }
+    model_spec = {
+        "n_diurnal": int(N_DIURNAL_HARMONICS),
+        "default_n_annual": int(DEFAULT_ANNUAL_HARMONICS),
+        "annual_per_param": {k: int(v) for k, v in annual_overrides.items()},
+        "ridge_lambda": float(ridge_lambda),
+    }
+
+    stats_T = compute_sufficient_stats(
+        prepared,
+        target="T",
+        n_diurnal=N_DIURNAL_HARMONICS,
+        default_n_annual=DEFAULT_ANNUAL_HARMONICS,
+        annual_per_param=annual_overrides,
+    )
+    report_T = evaluate_loyo(
+        stats_T,
+        ridge_lambda=ridge_lambda,
+        reference_spec=dict(reference_template),
+    )
+    evaluation_meta = {
+        "evaluation_time_base": "UTC",
+        "model_time_base": "solar",
+        "baseline": "climatology_mean per (utc_day, utc_hour), LOYO",
+    }
+    report_T.hyperparameters = {
+        "model": dict(model_spec),
+        "reference": dict(reference_template),
+        **evaluation_meta,
+    }
+    result.temperature_model.validation = report_T
+
+    stats_Q = compute_sufficient_stats(
+        prepared,
+        target="Q",
+        n_diurnal=N_DIURNAL_HARMONICS,
+        default_n_annual=DEFAULT_ANNUAL_HARMONICS,
+        annual_per_param=annual_overrides,
+    )
+    report_Q = evaluate_loyo(
+        stats_Q,
+        ridge_lambda=ridge_lambda,
+        reference_spec=dict(reference_template),
+    )
+    report_Q.hyperparameters = {
+        "model": dict(model_spec),
+        "reference": dict(reference_template),
+        **evaluation_meta,
+    }
+    result.specific_humidity_model.validation = report_Q
+
+    stats_P = compute_sufficient_stats(
+        prepared,
+        target="P",
+        n_diurnal=N_DIURNAL_HARMONICS,
+        default_n_annual=DEFAULT_ANNUAL_HARMONICS,
+        annual_per_param=annual_overrides,
+    )
+    report_P = evaluate_loyo(
+        stats_P,
+        ridge_lambda=ridge_lambda,
+        reference_spec=dict(reference_template),
+    )
+    report_P.hyperparameters = {
+        "model": dict(model_spec),
+        "reference": dict(reference_template),
+        **evaluation_meta,
+    }
+    result.pressure_model.validation = report_P
 
     temp_metrics = result.temperature_model.metrics
     q_metrics = result.specific_humidity_model.metrics
@@ -163,6 +322,7 @@ def _finalize_pipeline(
 
     for target, payload in payloads.items():
         path = path_map[target]
+        _export_training_metrics_files(model_fits[target], path)
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
         print(f"[OK] {payload['metadata']['target_variable']} parameters exported to {path}")
@@ -315,7 +475,7 @@ def run_pipeline(station_code: str = STATION_CODE, urls: Sequence[str] | None = 
     resolved_urls = list(urls) if urls is not None else build_urls_for_station(station_code)
     stream_result: StreamResult = stream_filter_to_disk(resolved_urls, station_code=station_code)
     artifact_paths = build_artifact_paths(stream_result.station_slug)
-    df = load_filtered_dataset(artifact_paths.parquet)
+    df = load_parquet_dataset(artifact_paths.parquet)
 
     return _finalize_pipeline(
         df=df,
@@ -371,7 +531,7 @@ def regenerate_pipeline(model_json: str | Path) -> StationMetadata:
 
     if artifact_paths.parquet.exists():
         print(f"[Cache] Using cached dataset at {artifact_paths.parquet}")
-        df = load_filtered_dataset(artifact_paths.parquet)
+        df = load_parquet_dataset(artifact_paths.parquet)
         if metadata:
             station_records.append(_record_from_metadata(metadata))
     else:
@@ -386,7 +546,7 @@ def regenerate_pipeline(model_json: str | Path) -> StationMetadata:
         )
         artifact_paths = build_artifact_paths(stream_result.station_slug)
         artifact_paths = _apply_model_path_override(artifact_paths, model_path, target_variable)
-        df = load_filtered_dataset(artifact_paths.parquet)
+        df = load_parquet_dataset(artifact_paths.parquet)
         station_records.extend(stream_result.station_records)
         station_name = stream_result.station_name
 
@@ -399,12 +559,29 @@ def regenerate_pipeline(model_json: str | Path) -> StationMetadata:
     )
 
 
-def display_pipeline(model_json: str | Path) -> Path:
-    """Render a yearly plot for a single target model and save it under generated/media."""
+def display_pipeline(
+    model_json: str | Path,
+    *,
+    mode: str = "annual",
+    day: int | None = None,
+    variables: Sequence[str] | None = None,
+) -> Path:
+    """Render plots for a target bundle with the requested variable panels."""
 
     ensure_directories()
 
+    mode_normalized = (mode or "annual").strip().lower()
+    if mode_normalized not in {"annual", "intraday"}:
+        raise ValueError(f"Unsupported display mode '{mode}'. Expected 'annual' or 'intraday'.")
+    if mode_normalized == "intraday":
+        if day is None:
+            raise ValueError("The 'intraday' mode requires a --day argument.")
+        day_int = int(day)
+    else:
+        day_int = None
+
     model_path = _resolve_model_path(model_json)
+    display_variables = normalize_display_variables(variables)
     base_payload = load_linear_model(model_path)
 
     metadata = base_payload.get("metadata", {})
@@ -422,6 +599,7 @@ def display_pipeline(model_json: str | Path) -> Path:
         station_slug = _slug_from_model_path(model_path)
 
     artifact_paths = build_artifact_paths(station_slug)
+    station_basename = compute_output_basename(station_slug)
 
     target_variable_raw = str(metadata.get("target_variable") or "").strip().upper()
     if target_variable_raw in _TARGET_SUFFIXES:
@@ -454,33 +632,88 @@ def display_pipeline(model_json: str | Path) -> Path:
             )
         payloads[key] = load_linear_model(path)
 
-    (
-        days,
-        Tmin,
-        Tmax,
-        Tavg,
-        Qmin,
-        Qmax,
-        Qavg,
-        Pmin,
-        Pmax,
-        Pavg,
-    ) = model_daily_stats_one_year_factorized(
-        payloads["T"],
-        payloads["Q"],
-        payloads["P"],
-    )
-
-    target_path = model_map[target_variable]
-    media_path = MEDIA_DIR / f"{target_path.stem}.png"
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
-    if target_variable == "T":
-        plot_year_temperature(days, Tmin, Tmax, Tavg, station_name, media_path)
-    elif target_variable == "Q":
-        plot_year_specific_humidity(days, Qmin, Qmax, Qavg, station_name, media_path)
+    hist_daily = None
+    hourly_hist = None
+    if artifact_paths.parquet.exists():
+        try:
+            sample_df = load_history_from_sample_data(artifact_paths.parquet)
+            hist_daily, hourly_hist = historical_climatology_daily(sample_df)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            print(f"[Warn] Failed to load historical dataset for overlays: {exc}")
+            hist_daily = None
+            hourly_hist = None
     else:
-        plot_year_pressure(days, Pmin, Pmax, Pavg, station_name, media_path)
+        print(
+            f"[Info] No cached dataset found at {artifact_paths.parquet}; plots will omit historical overlays.",
+        )
+
+    if mode_normalized == "intraday":
+        media_path = MEDIA_DIR / f"{station_basename}_intraday_{day_int:03d}.png"
+        plot_intraday(
+            payloads["T"],
+            payloads["Q"],
+            payloads["P"],
+            hourly_hist,
+            station_name,
+            day=day_int,
+            save_path=media_path,
+            variables=display_variables,
+        )
+    else:
+        (
+            days,
+            Tmin,
+            Tmax,
+            Tavg,
+            RHmin,
+            RHmax,
+            RHavg,
+            Tdmin,
+            Tdmax,
+            Tdavg,
+            Qmin,
+            Qmax,
+            Qavg,
+            Emin,
+            Emax,
+            Eavg,
+            Pmin,
+            Pmax,
+            Pavg,
+        ) = model_daily_stats_one_year_factorized(
+            payloads["T"],
+            payloads["Q"],
+            payloads["P"],
+        )
+
+        media_path = MEDIA_DIR / f"{station_basename}_annual.png"
+        plot_year(
+            days,
+            Tmin,
+            Tmax,
+            Tavg,
+            RHmin,
+            RHmax,
+            RHavg,
+            Tdmin,
+            Tdmax,
+            Tdavg,
+            Qmin,
+            Qmax,
+            Qavg,
+            Emin,
+            Emax,
+            Eavg,
+            Pmin,
+            Pmax,
+            Pavg,
+            station_name,
+            media_path,
+            hist_daily=hist_daily,
+            variables=display_variables,
+        )
 
     return media_path
 
