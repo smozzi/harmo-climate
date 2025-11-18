@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from .psychrometrics import (
-    dew_or_frost_point_c_from_e,
+    dew_point_c_from_e,
     relative_humidity_percent_from_specific,
     specific_humidity_kg_per_kg,
     thermo_from_T_P_RH,
@@ -172,7 +172,7 @@ def prepare_dataset(
         working["E"] = vapor_partial_pressure_hpa_from_q_p(working["Q"], working["P"])
 
     if td_needed:
-        working["Td"] = dew_or_frost_point_c_from_e(working["E"])
+        working["Td"] = dew_point_c_from_e(working["E"])
 
     # Ensure all requested columns exist before selection (e.g. derived but absent due to NaNs).
     missing_requested = [name for name in requested if name not in working.columns]
@@ -191,7 +191,7 @@ __all__ = [
     "load_parquet_dataset",
     "prepare_dataset",
     "relative_humidity_percent_from_specific",
-    "dew_or_frost_point_c_from_e",
+    "dew_point_c_from_e",
     "vapor_partial_pressure_hpa_from_q_p",
     "thermo_from_T_P_RH",
 ]

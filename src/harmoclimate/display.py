@@ -15,7 +15,7 @@ from matplotlib.figure import Figure
 from .config import SAMPLES_PER_DAY
 from .core import SOLAR_YEAR_DAYS, load_parquet_dataset, prepare_dataset
 from .psychrometrics import (
-    dew_or_frost_point_c_from_e,
+    dew_point_c_from_e,
     relative_humidity_percent_from_specific,
     vapor_partial_pressure_hpa_from_q_p,
 )
@@ -243,7 +243,7 @@ def model_daily_stats_one_year_factorized(
         P_array = np.asarray(pressures)
         RH_array = relative_humidity_percent_from_specific(T_array, Q_array, P_array)
         E_array = vapor_partial_pressure_hpa_from_q_p(Q_array, P_array)
-        Td_array = dew_or_frost_point_c_from_e(E_array)
+        Td_array = dew_point_c_from_e(E_array)
 
         Tmin[idx] = float(T_array.min())
         Tmax[idx] = float(T_array.max())
@@ -563,7 +563,7 @@ def model_intraday_solar(
     qs_arr = np.asarray(qs, dtype=float)
     ps_arr = np.asarray(ps, dtype=float)
     e_arr = vapor_partial_pressure_hpa_from_q_p(qs_arr, ps_arr)
-    td_arr = dew_or_frost_point_c_from_e(e_arr)
+    td_arr = dew_point_c_from_e(e_arr)
     rh_arr = relative_humidity_percent_from_specific(temps_arr, qs_arr, ps_arr)
     return hours, temps_arr, qs_arr, ps_arr, rh_arr, td_arr, e_arr
 
